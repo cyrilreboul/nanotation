@@ -45,7 +45,7 @@ def annotation_rows(
     records: Sequence[MrcSliceRecord],
     coordinate_scale: float = 1.0,
 ) -> list[dict[str, object]]:
-    """Convert napari z-y-x point coordinates into exportable rows."""
+    """Convert checkpoint and intersection coordinates into slice-wise export rows."""
 
     scale = _validated_coordinate_scale(coordinate_scale)
     points = np.asarray(coordinates, dtype=float)
@@ -56,16 +56,29 @@ def annotation_rows(
     if not np.isfinite(points).all():
         raise ValueError("Annotation coordinates must be finite.")
 
-    rows: list[dict[str, object]] = []
-    for point_id, (z_value, y_value, x_value) in enumerate(points, start=1):
-        slice_index = int(np.rint(z_value))
+    point_slice_indices = np.rint(points[:, 0]).astype(int)
+    for point_id, slice_index in enumerate(point_slice_indices, start=1):
         if slice_index < 0 or slice_index >= len(records):
+            z_value = points[point_id - 1, 0]
             raise ValueError(f"Point {point_id} is outside the loaded volume (z={z_value:g}).")
+
+    slice_indices = set(int(slice_index) for slice_index in point_slice_indices)
+    if len(points) >= 2:
+        first_slice = max(0, int(np.ceil(points[:, 0].min())))
+        last_slice = min(len(records) - 1, int(np.floor(points[:, 0].max())))
+        slice_indices.update(range(first_slice, last_slice + 1))
+
+    rows: list[dict[str, object]] = []
+    for slice_index in sorted(slice_indices):
+        coordinate = path_intersection_at_slice(points, slice_index)
+        if coordinate is None:
+            coordinate = points[point_slice_indices == slice_index].mean(axis=0)
+            coordinate[0] = slice_index
+        _z_value, y_value, x_value = coordinate
         rows.append(
             {
-                "point_id": point_id,
-                "slice_index": slice_index,
                 "filename": records[slice_index].name,
+                "slice_index": slice_index,
                 "x": float(x_value),
                 "y": float(y_value),
                 "xsc": float(scale * x_value),
@@ -82,7 +95,7 @@ def write_annotations_csv(
     coordinate_scale: float = 1.0,
 ) -> int:
     rows = annotation_rows(coordinates, records, coordinate_scale=coordinate_scale)
-    fieldnames = ["point_id", "slice_index", "filename", "x", "y", "xsc", "ysc"]
+    fieldnames = ["filename", "slice_index", "x", "y", "xsc", "ysc"]
     with path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
@@ -680,7 +693,7 @@ class VolumeAnnotationWidget(QWidget):
         self.load_session_button.clicked.connect(self._load_session)
         self.annotation_plot.slice_requested.connect(self._go_to_slice)
         self.viewer.camera.events.zoom.connect(self._update_zoom_label)
-        self.viewer.layers.selection.events.active.connect(self._hide_napari_interpolation_control)
+        self.viewer.layers.selection.events.active.connect(self._hide_napari_layer_controls)
         self.viewer.dims.events.current_step.connect(self._update_plot_slice_index)
         self._set_zoom(1.0)
 
@@ -776,8 +789,8 @@ class VolumeAnnotationWidget(QWidget):
             button.setEnabled(True)
         self._update_point_count()
         self._reset_zoom()
-        self._hide_napari_interpolation_control()
-        QTimer.singleShot(0, self._hide_napari_interpolation_control)
+        self._hide_napari_layer_controls()
+        QTimer.singleShot(0, self._hide_napari_layer_controls)
         if self._pending_session is not None:
             try:
                 self._restore_session(self._pending_session, points)
@@ -848,18 +861,58 @@ class VolumeAnnotationWidget(QWidget):
             if hasattr(layer, attribute):
                 setattr(layer, attribute, "linear")
 
-    def _hide_napari_interpolation_control(self, event=None) -> None:
+    def _hide_napari_layer_controls(self, event=None) -> None:
         del event
         qt_viewer = getattr(getattr(self.viewer, "window", None), "_qt_viewer", None)
         controls_container = getattr(qt_viewer, "controls", None)
+        controls_widgets = []
         controls = getattr(controls_container, "currentWidget", lambda: None)()
-        interpolation_control = getattr(controls, "_interpolation_control", None)
-        if interpolation_control is not None:
-            for widget_name in ("interpolation_combobox", "interpolation_combobox_label"):
-                widget = getattr(interpolation_control, widget_name, None)
+        if controls is not None:
+            controls_widgets.append(controls)
+        controls_widgets.extend(getattr(controls_container, "widgets", {}).values())
+        controls_to_hide = {
+            "_interpolation_control": (
+                "interpolation_combobox",
+                "interpolation_combobox_label",
+            ),
+            "_opacity_blending_controls": (
+                "blend_combobox",
+                "blend_label",
+            ),
+            "_projection_mode_control": (
+                "projection_combobox",
+                "projection_combobox_label",
+            ),
+            "_text_visibility_control": (
+                "text_disp_checkbox",
+                "text_disp_label",
+            ),
+            "_out_slice_checkbox_control": (
+                "out_of_slice_checkbox",
+                "out_of_slice_checkbox_label",
+            ),
+        }
+        for controls_widget in controls_widgets:
+            self._hide_widget_controls(controls_widget, controls_to_hide)
+        self._hide_fallback_layer_controls()
+
+    def _hide_widget_controls(
+        self,
+        controls,
+        control_widgets: dict[str, tuple[str, ...]],
+    ) -> None:
+        if controls is None:
+            return
+        for control_name, widget_names in control_widgets.items():
+            control = getattr(controls, control_name, None)
+            if control is None:
+                continue
+            for widget_name in widget_names:
+                widget = getattr(control, widget_name, None)
                 if widget is not None:
                     widget.setVisible(False)
 
+    def _hide_fallback_layer_controls(self) -> None:
         qt_window = getattr(getattr(self.viewer, "window", None), "_qt_window", None)
         if qt_window is None:
             return
@@ -1044,7 +1097,7 @@ class VolumeAnnotationWidget(QWidget):
         except Exception as exc:  # noqa: BLE001 - display export errors in the GUI.
             self._show_error(str(exc))
             return
-        self.summary_label.setText(f"Exported {count} points to {path}")
+        self.summary_label.setText(f"Exported {count} coordinate rows to {path}")
 
     def _update_point_count(self, event=None) -> None:
         del event

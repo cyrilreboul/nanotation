@@ -113,45 +113,97 @@ def test_scan_rejects_files_containing_multiple_slices(tmp_path: Path) -> None:
         scan_mrc_folder(tmp_path)
 
 
-def test_annotation_rows_include_slice_filename(tmp_path: Path) -> None:
+def test_annotation_rows_include_intersection_and_point_slices(tmp_path: Path) -> None:
+    for index in range(5):
+        _write_slice(tmp_path / f"slice{index}.mrc", np.zeros((3, 4), dtype=np.float32))
+    records = scan_mrc_folder(tmp_path)
+
+    rows = annotation_rows(
+        np.array([[0.0, 2.0, 4.0], [2.0, 6.0, 10.0]]),
+        records,
+        coordinate_scale=4,
+    )
+
+    assert [row["slice_index"] for row in rows] == [0, 1, 2]
+    assert [row["filename"] for row in rows] == ["slice0.mrc", "slice1.mrc", "slice2.mrc"]
+    assert rows[1] == {
+        "filename": "slice1.mrc",
+        "slice_index": 1,
+        "x": 7.0,
+        "y": 4.0,
+        "xsc": 28.0,
+        "ysc": 16.0,
+    }
+
+
+def test_annotation_rows_export_single_checkpoint_slice(tmp_path: Path) -> None:
     for index in range(3):
         _write_slice(tmp_path / f"slice{index}.mrc", np.zeros((3, 4), dtype=np.float32))
     records = scan_mrc_folder(tmp_path)
 
-    rows = annotation_rows(np.array([[0.0, 2.5, 3.5], [1.9, 1.0, 2.0]]), records, coordinate_scale=4)
+    rows = annotation_rows(np.array([[2.0, 1.0, 2.0]]), records, coordinate_scale=4)
 
-    assert rows[0] == {
-        "point_id": 1,
-        "slice_index": 0,
-        "filename": "slice0.mrc",
-        "x": 3.5,
-        "y": 2.5,
-        "xsc": 14.0,
-        "ysc": 10.0,
-    }
-    assert rows[1]["slice_index"] == 2
-    assert rows[1]["filename"] == "slice2.mrc"
+    assert rows == [
+        {
+            "filename": "slice2.mrc",
+            "slice_index": 2,
+            "x": 2.0,
+            "y": 1.0,
+            "xsc": 8.0,
+            "ysc": 4.0,
+        }
+    ]
+
+
+def test_annotation_rows_average_duplicate_point_slices(tmp_path: Path) -> None:
+    for index in range(3):
+        _write_slice(tmp_path / f"slice{index}.mrc", np.zeros((3, 4), dtype=np.float32))
+    records = scan_mrc_folder(tmp_path)
+
+    rows = annotation_rows(
+        np.array([[1.0, 2.0, 4.0], [1.0, 6.0, 10.0]]),
+        records,
+        coordinate_scale=2,
+    )
+
+    assert rows == [
+        {
+            "filename": "slice1.mrc",
+            "slice_index": 1,
+            "x": 7.0,
+            "y": 4.0,
+            "xsc": 14.0,
+            "ysc": 8.0,
+        }
+    ]
 
 
 def test_write_annotations_csv_supports_empty_and_populated_exports(tmp_path: Path) -> None:
-    _write_slice(tmp_path / "slice0.mrc", np.zeros((3, 4), dtype=np.float32))
+    for index in range(3):
+        _write_slice(tmp_path / f"slice{index}.mrc", np.zeros((3, 4), dtype=np.float32))
     records = scan_mrc_folder(tmp_path)
     output = tmp_path / "coordinates.csv"
 
     count = write_annotations_csv(output, np.empty((0, 3)), records)
     assert count == 0
-    assert output.read_text(encoding="utf-8").strip() == "point_id,slice_index,filename,x,y,xsc,ysc"
+    assert output.read_text(encoding="utf-8").strip() == "filename,slice_index,x,y,xsc,ysc"
 
-    count = write_annotations_csv(output, np.array([[0, 1.25, 2.5]]), records, coordinate_scale=4)
+    count = write_annotations_csv(
+        output,
+        np.array([[0, 1.0, 2.0], [2, 3.0, 6.0]]),
+        records,
+        coordinate_scale=4,
+    )
     with output.open(newline="", encoding="utf-8") as input_file:
         rows = list(csv.DictReader(input_file))
 
-    assert count == 1
-    assert rows[0]["filename"] == "slice0.mrc"
-    assert rows[0]["y"] == "1.25"
-    assert rows[0]["x"] == "2.5"
-    assert rows[0]["ysc"] == "5.0"
-    assert rows[0]["xsc"] == "10.0"
+    assert count == 3
+    assert [row["filename"] for row in rows] == ["slice0.mrc", "slice1.mrc", "slice2.mrc"]
+    assert rows[1]["slice_index"] == "1"
+    assert rows[1]["y"] == "2.0"
+    assert rows[1]["x"] == "4.0"
+    assert rows[1]["ysc"] == "8.0"
+    assert rows[1]["xsc"] == "16.0"
 
 
 def test_annotation_export_rejects_invalid_coordinate_scale(tmp_path: Path) -> None:

@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run(folder: Path | None = None) -> None:
     viewer = napari.Viewer(title="Nanotation")
     viewer.camera.zoom = 1.0
-    _hide_ndisplay_button(viewer)
+    _hide_viewer_mode_buttons(viewer)
     widget = VolumeAnnotationWidget(viewer, initial_folder=folder)
     dock_widget = viewer.window.add_dock_widget(widget, name="Nanotation", area="right")
 
@@ -32,22 +32,24 @@ def run(folder: Path | None = None) -> None:
             main_window.resizeDocks([dock_widget], [INITIAL_DOCK_WIDTH], Qt.Horizontal)
 
     QTimer.singleShot(0, resize_initial_dock)
-    QTimer.singleShot(0, lambda: _hide_ndisplay_button(viewer))
+    QTimer.singleShot(0, lambda: _hide_viewer_mode_buttons(viewer))
     napari.run()
 
 
-def _hide_ndisplay_button(viewer) -> None:
+def _hide_viewer_mode_buttons(viewer) -> None:
     qt_viewer = getattr(getattr(viewer, "window", None), "_qt_viewer", None)
     viewer_buttons = getattr(qt_viewer, "viewerButtons", None)
-    ndisplay_button = getattr(viewer_buttons, "ndisplayButton", None)
-    if ndisplay_button is not None:
-        ndisplay_button.setVisible(False)
+    for button_name in ("ndisplayButton", "gridViewButton"):
+        button = getattr(viewer_buttons, button_name, None)
+        if button is not None:
+            button.setVisible(False)
 
     qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
     if qt_window is None:
         return
     for button in qt_window.findChildren(QAbstractButton):
-        if "Toggle 2D/3D view" in button.toolTip():
+        tooltip = button.toolTip()
+        if "Toggle 2D/3D view" in tooltip or "Toggle grid mode" in tooltip:
             button.setVisible(False)
 
 

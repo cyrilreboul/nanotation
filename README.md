@@ -38,12 +38,11 @@ The app includes a folder picker when launched without a path.
 
 ## Volume Annotation CSV
 
-`nanotation` exports these columns:
+`nanotation` exports one row for every slice that contains either a path intersection or a checkpoint point. The CSV columns are:
 
-- `point_id`: sequential point number in the export
-- `slice_index`: zero-based index of the nearest volume slice
 - `filename`: MRC file corresponding to that slice
-- `x`, `y`: napari data coordinates in pixels
+- `slice_index`: zero-based index of the nearest volume slice
+- `x`, `y`: napari data coordinates in pixels, using linear path interpolation between checkpoint slices
 - `xsc`, `ysc`: `x` and `y` multiplied by the `XY-Coordinate scale ouput` value
 
-The CSV can also be exported when there are no points; it will contain only the header.
+The CSV can also be exported when there are no checkpoints; it will contain only the header.
