@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanotation"
+version = "0.1.0"
+description = "Standalone napari app for MRC volume annotation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mrcfile>=1.5",
+    "napari[all]>=0.5",
+    "numpy>=1.23",
+    "qtpy>=2.4",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[project.scripts]
+nanotation = "nanotation.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-p no:napari"
