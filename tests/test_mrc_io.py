@@ -15,13 +15,20 @@ from nanotation.widgets import (
     annotation_rows,
     annotation_xyz_coordinates,
     dashed_neighbor_segments,
+    DEFAULT_INTERPOLATION,
+    DEFAULT_OUTPUT_IMAGE_SIZE,
+    EMAN2_IMAGE_ORIENTATION_2D,
+    finite_intensity_range,
+    finite_intensity_standard_deviation,
     homogeneous_canvas_positions,
     nearest_projected_point,
     path_intersection_at_slice,
     point_slice_summary,
+    POINT_SIZE,
     read_session_file,
     slice_neighbor_edges,
     volume_box_segments,
+    VolumeAnnotationWidget,
     write_session_file,
     write_annotations_csv,
 )
@@ -111,6 +118,51 @@ def test_scan_rejects_files_containing_multiple_slices(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="one 2D slice"):
         scan_mrc_folder(tmp_path)
+
+
+def test_default_output_image_size_tracks_point_size() -> None:
+    assert DEFAULT_OUTPUT_IMAGE_SIZE == int(POINT_SIZE * 1.5)
+
+
+def test_eman2_image_orientation_sets_y_axis_up() -> None:
+    class Camera:
+        orientation2d = ("down", "right")
+
+    class Viewer:
+        camera = Camera()
+
+    class Widget:
+        viewer = Viewer()
+
+    VolumeAnnotationWidget._apply_eman2_image_orientation(Widget())
+
+    assert Widget.viewer.camera.orientation2d == EMAN2_IMAGE_ORIENTATION_2D
+
+
+def test_default_image_interpolation_is_bicubic() -> None:
+    class ImageLayer:
+        interpolation2d = "linear"
+        interpolation3d = "linear"
+
+    layer = ImageLayer()
+
+    VolumeAnnotationWidget._set_default_interpolation(None, layer)
+
+    assert DEFAULT_INTERPOLATION == "bicubic"
+    assert layer.interpolation2d == "bicubic"
+    assert layer.interpolation3d == "bicubic"
+
+
+def test_finite_intensity_range_ignores_nonfinite_values() -> None:
+    assert finite_intensity_range(np.array([np.nan, -2.0, 4.0, np.inf])) == (-2.0, 4.0)
+    assert finite_intensity_range(np.array([np.nan, np.inf])) is None
+
+
+def test_finite_intensity_standard_deviation_ignores_nonfinite_values() -> None:
+    values = np.array([np.nan, -1.0, 1.0, np.inf])
+
+    assert finite_intensity_standard_deviation(values) == pytest.approx(1.0)
+    assert finite_intensity_standard_deviation(np.array([np.nan, np.inf])) is None
 
 
 def test_annotation_rows_include_intersection_and_point_slices(tmp_path: Path) -> None:
