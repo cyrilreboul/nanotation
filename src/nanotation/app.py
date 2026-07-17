@@ -14,8 +14,15 @@ INITIAL_DOCK_WIDTH = 440
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="View successive MRC slices and annotate points in Nanotation.")
-    parser.add_argument("folder", nargs="?", type=Path, help="Folder containing successive MRC slices.")
+    parser = argparse.ArgumentParser(
+        description="View successive MRC frames and annotate points in Nanotation."
+    )
+    parser.add_argument(
+        "folder",
+        nargs="?",
+        type=Path,
+        help="Folder containing successive MRC frames.",
+    )
     return parser
 
 

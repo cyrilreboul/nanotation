@@ -17,8 +17,8 @@ NATURAL_SORT_PATTERN = re.compile(r"(\d+)")
 
 
 @dataclass(frozen=True, slots=True)
-class MrcSliceRecord:
-    """Metadata for one MRC file that contributes a slice to a volume."""
+class MrcFrameRecord:
+    """Metadata for one MRC file that contributes a frame to a time-series."""
 
     path: Path
     shape: tuple[int, int]
@@ -30,10 +30,10 @@ class MrcSliceRecord:
         return self.path.name
 
 
-class MrcSliceCatalog(Sequence[MrcSliceRecord]):
-    """Compact sequence of records that shares volume-wide metadata."""
+class MrcFrameCatalog(Sequence[MrcFrameRecord]):
+    """Compact sequence of records that shares time-series-wide metadata."""
 
-    def __init__(self, paths: Iterable[Path], template: MrcSliceRecord) -> None:
+    def __init__(self, paths: Iterable[Path], template: MrcFrameRecord) -> None:
         self._paths = tuple(paths)
         self._shape = template.shape
         self._dtype = template.dtype
@@ -45,7 +45,7 @@ class MrcSliceCatalog(Sequence[MrcSliceRecord]):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[item] for item in range(*index.indices(len(self)))]
-        return MrcSliceRecord(
+        return MrcFrameRecord(
             self._paths[index],
             self._shape,
             self._dtype,
@@ -54,7 +54,7 @@ class MrcSliceCatalog(Sequence[MrcSliceRecord]):
 
 
 def natural_sort_key(path: Path) -> tuple[object, ...]:
-    """Sort numbered filenames in human order (slice2 before slice10)."""
+    """Sort numbered filenames in human order (frame2 before frame10)."""
 
     return tuple(
         int(part) if part.isdigit() else part.casefold()
@@ -79,7 +79,7 @@ def iter_mrc_paths(folder: Path, *, recursive: bool = False) -> Iterable[Path]:
     yield from sorted(paths, key=natural_sort_key)
 
 
-def scan_mrc_folder(folder: Path, *, recursive: bool = False) -> Sequence[MrcSliceRecord]:
+def scan_mrc_folder(folder: Path, *, recursive: bool = False) -> Sequence[MrcFrameRecord]:
     if not folder.exists():
         raise FileNotFoundError(f"Folder does not exist: {folder}")
     if not folder.is_dir():
@@ -90,15 +90,15 @@ def scan_mrc_folder(folder: Path, *, recursive: bool = False) -> Sequence[MrcSli
         return []
 
     first = read_mrc_record(paths[0])
-    return MrcSliceCatalog(paths, first)
+    return MrcFrameCatalog(paths, first)
 
 
-def read_mrc_record(path: Path) -> MrcSliceRecord:
+def read_mrc_record(path: Path) -> MrcFrameRecord:
     with mrcfile.open(path, mode="r", permissive=True, header_only=True) as mrc:
         raw_shape = tuple(int(value) for value in (mrc.header.nz, mrc.header.ny, mrc.header.nx))
-        shape = _slice_shape(raw_shape, path)
+        shape = _frame_shape(raw_shape, path)
         mode = int(mrc.header.mode)
-        return MrcSliceRecord(
+        return MrcFrameRecord(
             path=path,
             shape=shape,
             dtype=str(np.dtype(mrcfile.utils.dtype_from_mode(mode))),
@@ -106,8 +106,8 @@ def read_mrc_record(path: Path) -> MrcSliceRecord:
         )
 
 
-def read_mrc_slice(path: Path) -> np.ndarray:
-    """Read one MRC file and require it to represent exactly one 2D slice."""
+def read_mrc_frame(path: Path) -> np.ndarray:
+    """Read one MRC file and require it to represent exactly one 2D frame."""
 
     opener = mrcfile.open if path.name.lower().endswith(".gz") else mrcfile.mmap
     with opener(path, mode="r", permissive=True) as mrc:
@@ -115,33 +115,33 @@ def read_mrc_slice(path: Path) -> np.ndarray:
         if data.ndim == 3 and data.shape[0] == 1:
             data = data[0]
         if data.ndim != 2:
-            raise ValueError(f"Expected one 2D slice in {path.name}, found shape {data.shape}.")
+            raise ValueError(f"Expected one 2D frame in {path.name}, found shape {data.shape}.")
         return data.copy()
 
 
-def load_mrc_volume(records: Sequence[MrcSliceRecord]) -> np.ndarray:
+def load_mrc_volume(records: Sequence[MrcFrameRecord]) -> np.ndarray:
     """Load naturally ordered MRC records into a z-y-x volume."""
 
     if not records:
         raise ValueError("No MRC files were found.")
 
     expected_shape = records[0].shape
-    slices = []
+    frames = []
     for record in records:
-        image = read_mrc_slice(record.path)
+        image = read_mrc_frame(record.path)
         if image.shape != expected_shape:
             raise ValueError(
-                f"All slices must have shape {expected_shape}; "
+                f"All frames must have shape {expected_shape}; "
                 f"{record.name} has shape {image.shape}."
             )
-        slices.append(image)
-    return np.stack(slices, axis=0)
+        frames.append(image)
+    return np.stack(frames, axis=0)
 
 
 class LazyMrcVolume:
-    """Array-like z-y-x volume that reads only requested MRC slices."""
+    """Array-like frame-y-x volume that reads only requested MRC frames."""
 
-    def __init__(self, records: Sequence[MrcSliceRecord], *, cache_size: int = 8) -> None:
+    def __init__(self, records: Sequence[MrcFrameRecord], *, cache_size: int = 8) -> None:
         if not records:
             raise ValueError("No MRC files were found.")
         if cache_size < 1:
@@ -172,22 +172,22 @@ class LazyMrcVolume:
     def __getitem__(self, key):
         z_key, y_key, x_key = _normalized_volume_key(key)
         if isinstance(z_key, Integral):
-            image = self._read_slice(int(z_key))
+            image = self._read_frame(int(z_key))
             return image[y_key, x_key]
 
         indices = range(*z_key.indices(self.shape[0]))
-        images = [self._read_slice(index)[y_key, x_key] for index in indices]
+        images = [self._read_frame(index)[y_key, x_key] for index in indices]
         if images:
             return np.stack(images, axis=0)
 
         sample_shape = np.empty(self.shape[1:], dtype=self.dtype)[y_key, x_key].shape
         return np.empty((0, *sample_shape), dtype=self.dtype)
 
-    def _read_slice(self, index: int) -> np.ndarray:
+    def _read_frame(self, index: int) -> np.ndarray:
         if index < 0:
             index += self.shape[0]
         if index < 0 or index >= self.shape[0]:
-            raise IndexError("MRC volume slice index out of range")
+            raise IndexError("MRC time-series frame index out of range")
 
         cached = self._cache.pop(index, None)
         if cached is not None:
@@ -195,15 +195,15 @@ class LazyMrcVolume:
             return cached
 
         record = self._records[index]
-        image = read_mrc_slice(record.path)
+        image = read_mrc_frame(record.path)
         if image.shape != self.shape[1:]:
             raise ValueError(
-                f"All slices must have shape {self.shape[1:]}; "
+                f"All frames must have shape {self.shape[1:]}; "
                 f"{record.name} has shape {image.shape}."
             )
         if image.dtype != self.dtype:
             raise ValueError(
-                f"All slices must have dtype {self.dtype}; "
+                f"All frames must have dtype {self.dtype}; "
                 f"{record.name} has dtype {image.dtype}."
             )
 
@@ -227,11 +227,13 @@ def _normalized_volume_key(key) -> tuple[int | slice, int | slice, int | slice]:
         )
     keys = (*keys, *(slice(None),) * (3 - len(keys)))
     if len(keys) != 3 or any(not isinstance(item, (Integral, slice)) for item in keys):
-        raise IndexError("MRC volumes support integer and slice indexing in z-y-x order")
+        raise IndexError(
+            "MRC time-series data supports integer and range indexing in frame-y-x order"
+        )
     return keys
 
 
-def volume_scale(records: Sequence[MrcSliceRecord]) -> tuple[float, float, float]:
+def volume_scale(records: Sequence[MrcFrameRecord]) -> tuple[float, float, float]:
     """Return napari z-y-x scale, using pixel units when metadata is absent."""
 
     if not records:
@@ -243,11 +245,11 @@ def volume_scale(records: Sequence[MrcSliceRecord]) -> tuple[float, float, float
     return (z_size, y_size, x_size)
 
 
-def _slice_shape(raw_shape: tuple[int, int, int], path: Path) -> tuple[int, int]:
+def _frame_shape(raw_shape: tuple[int, int, int], path: Path) -> tuple[int, int]:
     z_size, y_size, x_size = raw_shape
     if z_size != 1:
         raise ValueError(
-            f"Expected each file to contain one 2D slice; {path.name} has shape {raw_shape}."
+            f"Expected each file to contain one 2D frame; {path.name} has shape {raw_shape}."
         )
     return y_size, x_size
 

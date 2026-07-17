@@ -1,26 +1,35 @@
 # Nanotation
 
-Nanotation is a standalone napari desktop application for annotating successive MRC image slices as one volume.
+## Precision annotation for large MRC time-series
 
-Package: `nanotation`
+Nanotation is a focused desktop application for tracing structures and motion across successive electron-microscopy frames. It presents a folder of individual MRC images as one continuous time-series, allowing you to move naturally through the data and place precise checkpoints wherever they are needed.
 
-Launch command:
+As checkpoints are added, Nanotation builds a connected spatial path and displays it in an interactive 3D overview. The path is projected through the frames between checkpoints, making its progression easy to follow without requiring a point to be placed manually in every image.
 
-```bash
-nanotation /path/to/mrc/slices
-```
+Nanotation is designed to remain responsive with exceptionally large datasets. Images are opened only as they are viewed, so long time-series can be explored without loading the entire collection into memory.
 
-This app indexes individual MRC files from the selected folder as successive slices of one volume. It sorts numbered filenames naturally, opens at slice position zero, shows the folder as one scrollable napari volume, and exports per-slice point annotations to CSV. Slices are read only when viewed and recently viewed slices are cached; folder indexing also runs in the background so large datasets do not freeze the interface or fill memory at startup.
+## Highlights
 
-The viewer starts at `1.0x` zoom and uses EMAN2-style image orientation: the bottom-left image pixel is the base-zero origin, with y increasing upward. It includes `Zoom Out`, `Zoom 1:1`, and `Zoom In` controls.
+- Seamless navigation through naturally ordered MRC frames
+- Precise checkpoint placement with EMAN2-style image orientation
+- Smooth path estimation between annotated frames
+- Adjustable path smoothing for treating checkpoints as experimental measurements
+- Interactive, rotatable 3D overview of the complete annotated path
+- Direct navigation from a 3D checkpoint to its corresponding frame
+- Adjustable contrast through a compact interactive histogram
+- Session saving and restoration for long-running annotation work
+- Clean CSV export for downstream analysis
 
-Path checkpoints start with size `32`, border color `#0055ffff`, and opacity `0.6`. The right-side dock includes a read-only 3D scatter plot using the checkpoints' actual `(x, y, z)` coordinates. The VisPy canvas starts at `400x400`, shows a white volume bounding box and the current slice index, and highlights the current z-plane. Drag the plot to rotate it or scroll to zoom. A dashed path sorts checkpoints by slice index and connects only adjacent lower/higher-slice neighbors, so the first and last points have one connection and interior points have two.
+## Typical Workflow
 
-Clicking a point in the 3D plot moves the main napari viewer to that point's slice. `Save Session…` writes a compact `.nanotation.json` file containing the source folder, annotations, coordinate scale, current slice, zoom, and 3D camera state. `Load Session…` reopens the source images lazily and restores the saved annotations and views.
+1. Select a folder containing the MRC frames of a time-series.
+2. Move through the frames using the frame control.
+3. Place checkpoints at locations of interest.
+4. Adjust **Path Smoothness** between `0.00` and `1.00` if the measured checkpoints require more or less smoothing.
+5. Review the resulting path in the 3D overview and navigate by clicking its checkpoints.
+6. Save the session at any time or export the frame-by-frame coordinates.
 
-Between the first and last annotated slices, the main image viewer displays a locked white cross at 40% opacity at the exact linear intersection of the current slice with the dashed 3D path. The image layer uses bicubic interpolation by default. Below the zoom controls, the right panel shows a histogram for the current frame and a `Normalize Contrast` button. The button sets display limits to `-5σ` and `+5σ` from the current slice's finite-pixel standard deviation. Low/high contrast thresholds apply to all subsequently displayed frames and can be dragged directly on the histogram. `Output Image Size` defaults to `1.5 × point size`. The intersection is calculated on demand while scrolling, avoiding a large generated point layer for very large volumes. The right dock starts at a compact width and remains manually resizable.
-
-## Install
+## Installation
 
 ```bash
 python -m venv .venv
@@ -28,21 +37,32 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-## Run Without an Initial Folder
+## Launch
+
+Open Nanotation with a time-series folder:
+
+```bash
+nanotation /path/to/mrc/frames
+```
+
+Alternatively, launch it without a path and choose a folder from the application:
 
 ```bash
 nanotation
 ```
 
-The app includes a folder picker when launched without a path.
+## Sessions
 
-## Volume Annotation CSV
+Use **Save Session…** to preserve the source folder, checkpoints, path smoothness, current frame, zoom level, and 3D viewpoint. **Load Session…** restores the workspace so annotation can continue from the same point.
 
-`nanotation` exports one row for every slice that contains either a path intersection or a checkpoint point. The CSV columns are:
+## Coordinate Export
 
-- `filename`: MRC file corresponding to that slice
-- `slice_index`: zero-based index of the nearest volume slice
-- `x`, `y`: base-zero image coordinates in pixels, with origin at the bottom-left and linear path interpolation between checkpoint slices
-- `xsc`, `ysc`: `x` and `y` multiplied by the `XY-Coordinate scale ouput` value
+Nanotation exports one CSV row for each frame containing either a checkpoint or a smoothed path position:
 
-The CSV can also be exported when there are no checkpoints; it will contain only the header.
+| Column | Description |
+|---|---|
+| `filename` | MRC file associated with the frame |
+| `frame_number` | One-based frame number |
+| `x`, `y` | Base-zero image coordinates, measured from the bottom-left origin |
+
+The exported path is ready for analysis, visualization, or integration into a larger processing workflow.
