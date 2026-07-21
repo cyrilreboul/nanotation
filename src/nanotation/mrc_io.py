@@ -24,90 +24,113 @@ class MrcFrameRecord:
     shape: tuple[int, int]
     dtype: str
     voxel_size: tuple[float, float, float] | None
+    data_offset: int = 1024
 
     @property
     def name(self) -> str:
         return self.path.name
 
 
-class MrcFrameCatalog(Sequence[MrcFrameRecord]):
+class MrcFrameSequence(Sequence[MrcFrameRecord]):
     """Compact sequence of records that shares time-series-wide metadata."""
 
-    def __init__(self, paths: Iterable[Path], template: MrcFrameRecord) -> None:
-        self._paths = tuple(paths)
+    def __init__(
+        self,
+        folder: Path,
+        relative_paths: Iterable[str],
+        template: MrcFrameRecord,
+    ) -> None:
+        self._folder = folder
+        self._relative_paths = tuple(relative_paths)
         self._shape = template.shape
         self._dtype = template.dtype
         self._voxel_size = template.voxel_size
+        self._data_offset = template.data_offset
 
     def __len__(self) -> int:
-        return len(self._paths)
+        return len(self._relative_paths)
 
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[item] for item in range(*index.indices(len(self)))]
         return MrcFrameRecord(
-            self._paths[index],
+            self._folder / self._relative_paths[index],
             self._shape,
             self._dtype,
             self._voxel_size,
+            self._data_offset,
         )
 
 
-def natural_sort_key(path: Path) -> tuple[object, ...]:
+def natural_sort_key(path: Path | str) -> tuple[object, ...]:
     """Sort numbered filenames in human order (frame2 before frame10)."""
 
+    name = path.name if isinstance(path, Path) else path
     return tuple(
         int(part) if part.isdigit() else part.casefold()
-        for part in NATURAL_SORT_PATTERN.split(path.name)
+        for part in NATURAL_SORT_PATTERN.split(name)
     )
 
 
-def is_mrc_path(path: Path) -> bool:
-    return path.is_file() and path.name.lower().endswith(MRC_SUFFIXES)
+def _mrc_filenames(folder: Path) -> list[str]:
+    with os.scandir(folder) as entries:
+        names = [
+            entry.name
+            for entry in entries
+            if entry.is_file() and entry.name.lower().endswith(MRC_SUFFIXES)
+        ]
+    names.sort(key=natural_sort_key)
+    return names
 
 
-def iter_mrc_paths(folder: Path, *, recursive: bool = False) -> Iterable[Path]:
-    if recursive:
-        paths = (path for path in folder.glob("**/*") if is_mrc_path(path))
-    else:
-        with os.scandir(folder) as entries:
-            paths = [
-                Path(entry.path)
-                for entry in entries
-                if entry.is_file() and entry.name.lower().endswith(MRC_SUFFIXES)
-            ]
-    yield from sorted(paths, key=natural_sort_key)
-
-
-def scan_mrc_folder(folder: Path, *, recursive: bool = False) -> Sequence[MrcFrameRecord]:
+def scan_mrc_folder(
+    folder: Path,
+) -> Sequence[MrcFrameRecord]:
     if not folder.exists():
         raise FileNotFoundError(f"Folder does not exist: {folder}")
     if not folder.is_dir():
         raise NotADirectoryError(f"Expected a folder: {folder}")
 
-    paths = list(iter_mrc_paths(folder, recursive=recursive))
-    if not paths:
+    folder = folder.resolve()
+    relative_paths = tuple(_mrc_filenames(folder))
+    if not relative_paths:
         return []
 
-    first = read_mrc_record(paths[0])
-    return MrcFrameCatalog(paths, first)
+    first = read_mrc_record(folder / relative_paths[0])
+    return MrcFrameSequence(folder, relative_paths, first)
 
 
 def read_mrc_record(path: Path) -> MrcFrameRecord:
     with mrcfile.open(path, mode="r", permissive=True, header_only=True) as mrc:
         raw_shape = tuple(int(value) for value in (mrc.header.nz, mrc.header.ny, mrc.header.nx))
         shape = _frame_shape(raw_shape, path)
-        mode = int(mrc.header.mode)
         return MrcFrameRecord(
             path=path,
             shape=shape,
-            dtype=str(np.dtype(mrcfile.utils.dtype_from_mode(mode))),
+            dtype=str(np.dtype(mrcfile.utils.data_dtype_from_header(mrc.header))),
             voxel_size=_voxel_size_tuple(mrc.voxel_size),
+            data_offset=1024 + int(mrc.header.nsymbt),
         )
 
 
-def read_mrc_frame(path: Path) -> np.ndarray:
+def read_mrc_frame(
+    path: Path,
+    *,
+    shape: tuple[int, int] | None = None,
+    dtype: np.dtype | str | None = None,
+    data_offset: int | None = None,
+) -> np.ndarray:
     """Read one MRC file and require it to represent exactly one 2D frame."""
+
+    if (
+        shape is not None
+        and dtype is not None
+        and data_offset is not None
+        and not path.name.lower().endswith(".gz")
+    ):
+        mapped = _memory_map_frame(path, shape, np.dtype(dtype), data_offset)
+        if mapped is not None:
+            return mapped
 
     opener = mrcfile.open if path.name.lower().endswith(".gz") else mrcfile.mmap
     with opener(path, mode="r", permissive=True) as mrc:
@@ -119,27 +142,8 @@ def read_mrc_frame(path: Path) -> np.ndarray:
         return data.copy()
 
 
-def load_mrc_volume(records: Sequence[MrcFrameRecord]) -> np.ndarray:
-    """Load naturally ordered MRC records into a z-y-x volume."""
-
-    if not records:
-        raise ValueError("No MRC files were found.")
-
-    expected_shape = records[0].shape
-    frames = []
-    for record in records:
-        image = read_mrc_frame(record.path)
-        if image.shape != expected_shape:
-            raise ValueError(
-                f"All frames must have shape {expected_shape}; "
-                f"{record.name} has shape {image.shape}."
-            )
-        frames.append(image)
-    return np.stack(frames, axis=0)
-
-
-class LazyMrcVolume:
-    """Array-like frame-y-x volume that reads only requested MRC frames."""
+class LazyMrcTimeSeries:
+    """Array-like frame-y-x time-series that reads only requested MRC frames."""
 
     def __init__(self, records: Sequence[MrcFrameRecord], *, cache_size: int = 8) -> None:
         if not records:
@@ -170,12 +174,12 @@ class LazyMrcVolume:
         return int(np.prod(self._shape))
 
     def __getitem__(self, key):
-        z_key, y_key, x_key = _normalized_volume_key(key)
-        if isinstance(z_key, Integral):
-            image = self._read_frame(int(z_key))
+        frame_key, y_key, x_key = _normalized_time_series_key(key)
+        if isinstance(frame_key, Integral):
+            image = self._read_frame(int(frame_key))
             return image[y_key, x_key]
 
-        indices = range(*z_key.indices(self.shape[0]))
+        indices = range(*frame_key.indices(self.shape[0]))
         images = [self._read_frame(index)[y_key, x_key] for index in indices]
         if images:
             return np.stack(images, axis=0)
@@ -195,7 +199,12 @@ class LazyMrcVolume:
             return cached
 
         record = self._records[index]
-        image = read_mrc_frame(record.path)
+        image = read_mrc_frame(
+            record.path,
+            shape=record.shape,
+            dtype=record.dtype,
+            data_offset=record.data_offset,
+        )
         if image.shape != self.shape[1:]:
             raise ValueError(
                 f"All frames must have shape {self.shape[1:]}; "
@@ -213,7 +222,42 @@ class LazyMrcVolume:
         return image
 
 
-def _normalized_volume_key(key) -> tuple[int | slice, int | slice, int | slice]:
+def _memory_map_frame(
+    path: Path,
+    shape: tuple[int, int],
+    dtype: np.dtype,
+    data_offset: int,
+) -> np.ndarray | None:
+    if data_offset < 1024:
+        raise ValueError(f"Invalid MRC data offset in {path.name}: {data_offset}.")
+    expected_bytes = int(np.prod(shape)) * dtype.itemsize
+    try:
+        raw = np.memmap(path, dtype=np.uint8, mode="r")
+    except (OSError, ValueError):
+        return None
+    if raw.size < 1024 or bytes(raw[208:211]) != b"MAP":
+        return None
+    try:
+        byte_order = mrcfile.utils.byte_order_from_machine_stamp(raw[212:216])
+        header_values = np.frombuffer(raw, dtype=f"{byte_order}i4", count=24)
+        actual_shape = tuple(int(value) for value in header_values[2::-1])
+        actual_dtype = np.dtype(
+            mrcfile.utils.dtype_from_mode(int(header_values[3]))
+        ).newbyteorder(byte_order)
+        actual_data_offset = 1024 + int(header_values[23])
+    except (TypeError, ValueError):
+        return None
+    if (
+        actual_shape != (1, *shape)
+        or actual_dtype != dtype
+        or actual_data_offset != data_offset
+        or raw.size - data_offset != expected_bytes
+    ):
+        return None
+    return raw[data_offset:].view(dtype).reshape(shape)
+
+
+def _normalized_time_series_key(key) -> tuple[int | slice, int | slice, int | slice]:
     keys = key if isinstance(key, tuple) else (key,)
     if keys.count(Ellipsis) > 1:
         raise IndexError("Only one ellipsis is allowed in an index")
@@ -233,7 +277,7 @@ def _normalized_volume_key(key) -> tuple[int | slice, int | slice, int | slice]:
     return keys
 
 
-def volume_scale(records: Sequence[MrcFrameRecord]) -> tuple[float, float, float]:
+def time_series_scale(records: Sequence[MrcFrameRecord]) -> tuple[float, float, float]:
     """Return napari z-y-x scale, using pixel units when metadata is absent."""
 
     if not records:

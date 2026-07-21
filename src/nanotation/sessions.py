@@ -19,7 +19,7 @@ SESSION_VERSION = 3
 class NanotationSession:
     source_folder: Path
     annotations: np.ndarray
-    image_count: int
+    frame_count: int
     first_filename: str
     last_filename: str
     frame_number: int
@@ -90,7 +90,7 @@ def read_session_file(path: Path) -> NanotationSession:
             points = np.empty((0, 3), dtype=float)
         if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
             raise ValueError("invalid annotation coordinates")
-        image_count = int(payload["image_count"])
+        frame_count = int(payload["image_count"])
         frame_number = (
             int(payload["slice_index"]) + 1
             if version == 1
@@ -103,9 +103,9 @@ def read_session_file(path: Path) -> NanotationSession:
             else DEFAULT_PATH_SMOOTHNESS
         )
         if (
-            image_count < 1
+            frame_count < 1
             or frame_number < 1
-            or frame_number > image_count
+            or frame_number > frame_count
             or not np.isfinite(zoom)
             or zoom <= 0
             or not np.isfinite(path_smoothness)
@@ -119,7 +119,7 @@ def read_session_file(path: Path) -> NanotationSession:
         return NanotationSession(
             source_folder=Path(payload["source_folder"]).expanduser(),
             annotations=points,
-            image_count=image_count,
+            frame_count=frame_count,
             first_filename=str(payload["first_filename"]),
             last_filename=str(payload["last_filename"]),
             frame_number=frame_number,

@@ -1,4 +1,3 @@
-import csv
 from pathlib import Path
 
 import mrcfile
@@ -8,33 +7,38 @@ import pytest
 from nanotation.annotations import (
     DEFAULT_PATH_SMOOTHNESS,
     SmoothedPath,
-    annotation_rows,
     annotation_xyz_coordinates,
     dashed_neighbor_segments,
     frame_neighbor_edges,
-    path_intersection_at_frame,
-    write_annotations_csv,
+    iter_annotation_entries,
+    write_annotation_entries,
+)
+from nanotation.histogram import (
+    finite_intensity_standard_deviation,
+    standard_deviation_limits,
 )
 from nanotation.mrc_io import (
-    LazyMrcVolume,
-    load_mrc_volume,
+    LazyMrcTimeSeries,
     scan_mrc_folder,
-    volume_scale,
+    time_series_scale,
+)
+from nanotation.napari_ui import (
+    DEFAULT_INTERPOLATION,
+    EMAN2_IMAGE_ORIENTATION_2D,
+    apply_eman2_image_orientation,
+    set_default_image_interpolation,
 )
 from nanotation.plot3d import (
+    CHECKPOINT_MARKER_SIZE,
+    bounding_box_segments,
     homogeneous_canvas_positions,
     nearest_projected_point,
-    volume_box_segments,
 )
 from nanotation.sessions import read_session_file, write_session_file
 from nanotation.widgets import (
-    DEFAULT_INTERPOLATION,
-    EMAN2_IMAGE_ORIENTATION_2D,
-    finite_intensity_standard_deviation,
-    finite_standard_deviation_limits,
-    finite_symmetric_standard_deviation_limits,
-    POINT_SIZE,
-    VolumeAnnotationWidget,
+    IMAGE_CHECKPOINT_SIZE,
+    _capture_refresh_annotations,
+    _remap_refresh_annotations,
 )
 
 
@@ -45,31 +49,31 @@ def _write_frame(path: Path, data: np.ndarray, voxel_size: float | None = None) 
             mrc.voxel_size = voxel_size
 
 
-def test_scan_naturally_sorts_and_loads_volume(tmp_path: Path) -> None:
+def test_scan_naturally_sorts_time_series(tmp_path: Path) -> None:
     _write_frame(tmp_path / "frame10.mrc", np.full((3, 4), 10, dtype=np.float32), 1.5)
     _write_frame(tmp_path / "frame2.mrc", np.full((3, 4), 2, dtype=np.float32), 1.5)
     _write_frame(tmp_path / "frame1.mrc", np.full((3, 4), 1, dtype=np.float32), 1.5)
 
     records = scan_mrc_folder(tmp_path)
-    volume = load_mrc_volume(records)
+    time_series = LazyMrcTimeSeries(records)
 
     assert [record.name for record in records] == ["frame1.mrc", "frame2.mrc", "frame10.mrc"]
-    assert volume.shape == (3, 3, 4)
-    np.testing.assert_array_equal(volume[:, 0, 0], [1, 2, 10])
-    assert volume_scale(records) == (1.5, 1.5, 1.5)
+    assert time_series.shape == (3, 3, 4)
+    np.testing.assert_array_equal(time_series[:, 0, 0], [1, 2, 10])
+    assert time_series_scale(records) == (1.5, 1.5, 1.5)
 
 
-def test_volume_rejects_mismatched_frame_shapes(tmp_path: Path) -> None:
+def test_time_series_rejects_mismatched_frame_shapes(tmp_path: Path) -> None:
     _write_frame(tmp_path / "frame1.mrc", np.zeros((3, 4), dtype=np.float32))
     _write_frame(tmp_path / "frame2.mrc", np.zeros((4, 4), dtype=np.float32))
 
     records = scan_mrc_folder(tmp_path)
 
     with pytest.raises(ValueError, match="All frames must have shape"):
-        load_mrc_volume(records)
+        LazyMrcTimeSeries(records)[1]
 
 
-def test_lazy_volume_reads_only_requested_frames(tmp_path: Path, monkeypatch) -> None:
+def test_lazy_time_series_reads_only_requested_frames(tmp_path: Path, monkeypatch) -> None:
     for index in range(3):
         _write_frame(tmp_path / f"frame{index}.mrc", np.full((3, 4), index, dtype=np.float32))
     records = scan_mrc_folder(tmp_path)
@@ -79,21 +83,56 @@ def test_lazy_volume_reads_only_requested_frames(tmp_path: Path, monkeypatch) ->
     original_read = mrc_io.read_mrc_frame
     reads = []
 
-    def tracked_read(path: Path) -> np.ndarray:
+    def tracked_read(path: Path, **kwargs) -> np.ndarray:
         reads.append(path.name)
-        return original_read(path)
+        return original_read(path, **kwargs)
 
     monkeypatch.setattr(mrc_io, "read_mrc_frame", tracked_read)
-    volume = LazyMrcVolume(records, cache_size=2)
+    time_series = LazyMrcTimeSeries(records, cache_size=2)
 
-    np.testing.assert_array_equal(volume[1], np.full((3, 4), 1, dtype=np.float32))
-    np.testing.assert_array_equal(volume[1, 1:, :2], np.full((2, 2), 1, dtype=np.float32))
-    np.testing.assert_array_equal(volume[1, ...], np.full((3, 4), 1, dtype=np.float32))
-    np.testing.assert_array_equal(volume[-1], np.full((3, 4), 2, dtype=np.float32))
+    np.testing.assert_array_equal(time_series[1], np.full((3, 4), 1, dtype=np.float32))
+    np.testing.assert_array_equal(time_series[1, 1:, :2], np.full((2, 2), 1, dtype=np.float32))
+    np.testing.assert_array_equal(time_series[1, ...], np.full((3, 4), 1, dtype=np.float32))
+    np.testing.assert_array_equal(time_series[-1], np.full((3, 4), 2, dtype=np.float32))
 
-    assert volume.shape == (3, 3, 4)
-    assert volume.ndim == 3
+    assert time_series.shape == (3, 3, 4)
+    assert time_series.ndim == 3
     assert reads == ["frame1.mrc", "frame2.mrc"]
+
+
+def test_lazy_time_series_uses_direct_memory_mapping(tmp_path: Path, monkeypatch) -> None:
+    _write_frame(tmp_path / "frame0.mrc", np.arange(12, dtype=np.float32).reshape(3, 4))
+    records = scan_mrc_folder(tmp_path)
+
+    from nanotation import mrc_io
+
+    def unexpected_mrc_open(*args, **kwargs):
+        raise AssertionError("Uniform uncompressed frames should not be reparsed")
+
+    monkeypatch.setattr(mrc_io.mrcfile, "mmap", unexpected_mrc_open)
+
+    image = LazyMrcTimeSeries(records)[0]
+
+    assert isinstance(image, np.memmap)
+    np.testing.assert_array_equal(image, np.arange(12, dtype=np.float32).reshape(3, 4))
+
+
+def test_lazy_time_series_falls_back_for_mismatched_layout(tmp_path: Path) -> None:
+    _write_frame(tmp_path / "frame0.mrc", np.zeros((3, 4), dtype=np.float32))
+    _write_frame(tmp_path / "frame1.mrc", np.zeros((4, 4), dtype=np.float32))
+    records = scan_mrc_folder(tmp_path)
+
+    with pytest.raises(ValueError, match="All frames must have shape"):
+        LazyMrcTimeSeries(records)[1]
+
+
+def test_lazy_time_series_rejects_same_size_mismatched_dtype(tmp_path: Path) -> None:
+    _write_frame(tmp_path / "frame0.mrc", np.zeros((3, 4), dtype=np.float16))
+    _write_frame(tmp_path / "frame1.mrc", np.zeros((3, 4), dtype=np.int16))
+    records = scan_mrc_folder(tmp_path)
+
+    with pytest.raises(ValueError, match="All frames must have dtype"):
+        LazyMrcTimeSeries(records)[1]
 
 
 def test_scan_reads_only_first_header(tmp_path: Path, monkeypatch) -> None:
@@ -117,6 +156,65 @@ def test_scan_reads_only_first_header(tmp_path: Path, monkeypatch) -> None:
     assert reads == ["frame0.mrc"]
 
 
+def test_scan_does_not_create_index_files(tmp_path: Path) -> None:
+    for index in range(3):
+        _write_frame(tmp_path / f"frame{index}.mrc", np.zeros((3, 4), dtype=np.float32))
+    original_files = {path.name for path in tmp_path.iterdir()}
+
+    scan_mrc_folder(tmp_path)
+
+    assert {path.name for path in tmp_path.iterdir()} == original_files
+
+
+def test_refresh_remaps_checkpoints_and_drops_deleted_files(tmp_path: Path) -> None:
+    for frame_number in (1, 3, 5):
+        _write_frame(
+            tmp_path / f"frame{frame_number}.mrc",
+            np.zeros((3, 4), dtype=np.float32),
+        )
+    old_records = scan_mrc_folder(tmp_path)
+    refresh_annotations = _capture_refresh_annotations(
+        np.array([[0, 1, 2], [1, 3, 4], [2, 5, 6]], dtype=float),
+        old_records,
+    )
+    assert refresh_annotations is not None
+
+    _write_frame(tmp_path / "frame0.mrc", np.zeros((3, 4), dtype=np.float32))
+    (tmp_path / "frame3.mrc").unlink()
+    new_records = scan_mrc_folder(tmp_path)
+
+    remapped, removed_count = _remap_refresh_annotations(
+        refresh_annotations,
+        new_records,
+    )
+
+    np.testing.assert_array_equal(remapped, [[1, 1, 2], [2, 5, 6]])
+    assert removed_count == 1
+
+
+def test_refresh_does_not_remap_checkpoints_to_another_folder(tmp_path: Path) -> None:
+    original_folder = tmp_path / "original"
+    replacement_folder = tmp_path / "replacement"
+    original_folder.mkdir()
+    replacement_folder.mkdir()
+    for folder in (original_folder, replacement_folder):
+        _write_frame(folder / "frame1.mrc", np.zeros((3, 4), dtype=np.float32))
+
+    refresh_annotations = _capture_refresh_annotations(
+        np.array([[0, 1, 2]], dtype=float),
+        scan_mrc_folder(original_folder),
+    )
+    assert refresh_annotations is not None
+
+    remapped, removed_count = _remap_refresh_annotations(
+        refresh_annotations,
+        scan_mrc_folder(replacement_folder),
+    )
+
+    assert remapped.shape == (0, 3)
+    assert removed_count == 1
+
+
 def test_scan_rejects_files_containing_multiple_frames(tmp_path: Path) -> None:
     _write_frame(tmp_path / "stack.mrc", np.zeros((2, 3, 4), dtype=np.float32))
 
@@ -131,12 +229,10 @@ def test_eman2_image_orientation_sets_y_axis_up() -> None:
     class Viewer:
         camera = Camera()
 
-    class Widget:
-        viewer = Viewer()
+    viewer = Viewer()
+    apply_eman2_image_orientation(viewer)
 
-    VolumeAnnotationWidget._apply_eman2_image_orientation(Widget())
-
-    assert Widget.viewer.camera.orientation2d == EMAN2_IMAGE_ORIENTATION_2D
+    assert viewer.camera.orientation2d == EMAN2_IMAGE_ORIENTATION_2D
 
 
 def test_default_image_interpolation_is_bicubic() -> None:
@@ -146,11 +242,16 @@ def test_default_image_interpolation_is_bicubic() -> None:
 
     layer = ImageLayer()
 
-    VolumeAnnotationWidget._set_default_interpolation(None, layer)
+    set_default_image_interpolation(layer)
 
     assert DEFAULT_INTERPOLATION == "bicubic"
     assert layer.interpolation2d == "bicubic"
     assert layer.interpolation3d == "bicubic"
+
+
+def test_default_checkpoint_sizes_are_distinct_for_image_and_3d_views() -> None:
+    assert IMAGE_CHECKPOINT_SIZE == 32
+    assert CHECKPOINT_MARKER_SIZE == 14
 
 
 def test_finite_intensity_standard_deviation_ignores_nonfinite_values() -> None:
@@ -161,99 +262,80 @@ def test_finite_intensity_standard_deviation_ignores_nonfinite_values() -> None:
     assert finite_intensity_standard_deviation(None) is None
 
 
-def test_finite_symmetric_standard_deviation_limits() -> None:
-    values = np.array([np.nan, -1.0, 1.0, np.inf])
-
-    assert finite_symmetric_standard_deviation_limits(values, 4.0) == pytest.approx((-4.0, 4.0))
-    assert finite_symmetric_standard_deviation_limits(np.array([2.0, 2.0]), 4.0) == (-1.0, 1.0)
+def test_standard_deviation_limits() -> None:
+    assert standard_deviation_limits(1.0, -3.0, 4.0) == (-3.0, 4.0)
+    assert standard_deviation_limits(0.0, -3.0, 4.0) == (-1.0, 1.0)
 
 
-def test_finite_asymmetric_standard_deviation_limits() -> None:
-    values = np.array([np.nan, -1.0, 1.0, np.inf])
-
-    assert finite_standard_deviation_limits(values, -3.0, 4.0) == pytest.approx((-3.0, 4.0))
-
-
-def test_annotation_rows_include_intersection_and_point_frames(tmp_path: Path) -> None:
+def test_annotation_entries_include_intersection_and_checkpoint_frames(tmp_path: Path) -> None:
     for index in range(5):
         _write_frame(tmp_path / f"frame{index}.mrc", np.zeros((3, 4), dtype=np.float32))
     records = scan_mrc_folder(tmp_path)
 
-    rows = annotation_rows(
-        np.array([[0.0, 2.0, 4.0], [2.0, 6.0, 10.0]]),
-        records,
+    entries = list(
+        iter_annotation_entries(
+            np.array([[0.0, 2.0, 4.0], [2.0, 6.0, 10.0]]),
+            records,
+        )
     )
 
-    assert [row["frame_number"] for row in rows] == [1, 2, 3]
-    assert [row["filename"] for row in rows] == ["frame0.mrc", "frame1.mrc", "frame2.mrc"]
-    assert rows[1] == {
-        "filename": "frame1.mrc",
-        "frame_number": 2,
-        "x": 7.0,
-        "y": 4.0,
-    }
-
-
-def test_annotation_rows_export_single_checkpoint_frame(tmp_path: Path) -> None:
-    for index in range(3):
-        _write_frame(tmp_path / f"frame{index}.mrc", np.zeros((3, 4), dtype=np.float32))
-    records = scan_mrc_folder(tmp_path)
-
-    rows = annotation_rows(np.array([[2.0, 1.0, 2.0]]), records)
-
-    assert rows == [
-        {
-            "filename": "frame2.mrc",
-            "frame_number": 3,
-            "x": 2.0,
-            "y": 1.0,
-        }
+    assert entries == [
+        f"filename={tmp_path / 'frame0.mrc'} x=4.0 y=2.0 index=1 xdim=4 ydim=3",
+        f"filename={tmp_path / 'frame1.mrc'} x=7.0 y=4.0 index=2 xdim=4 ydim=3",
+        f"filename={tmp_path / 'frame2.mrc'} x=10.0 y=6.0 index=3 xdim=4 ydim=3",
     ]
 
 
-def test_annotation_rows_average_duplicate_point_frames(tmp_path: Path) -> None:
+def test_annotation_entries_export_single_checkpoint_frame(tmp_path: Path) -> None:
     for index in range(3):
         _write_frame(tmp_path / f"frame{index}.mrc", np.zeros((3, 4), dtype=np.float32))
     records = scan_mrc_folder(tmp_path)
 
-    rows = annotation_rows(
-        np.array([[1.0, 2.0, 4.0], [1.0, 6.0, 10.0]]),
-        records,
-    )
+    entries = list(iter_annotation_entries(np.array([[2.0, 1.0, 2.0]]), records))
 
-    assert rows == [
-        {
-            "filename": "frame1.mrc",
-            "frame_number": 2,
-            "x": 7.0,
-            "y": 4.0,
-        }
+    assert entries == [
+        f"filename={tmp_path / 'frame2.mrc'} x=2.0 y=1.0 index=3 xdim=4 ydim=3"
     ]
 
 
-def test_write_annotations_csv_supports_empty_and_populated_exports(tmp_path: Path) -> None:
+def test_annotation_entries_average_duplicate_checkpoint_frames(tmp_path: Path) -> None:
     for index in range(3):
         _write_frame(tmp_path / f"frame{index}.mrc", np.zeros((3, 4), dtype=np.float32))
     records = scan_mrc_folder(tmp_path)
-    output = tmp_path / "coordinates.csv"
 
-    count = write_annotations_csv(output, np.empty((0, 3)), records)
+    entries = list(
+        iter_annotation_entries(
+            np.array([[1.0, 2.0, 4.0], [1.0, 6.0, 10.0]]),
+            records,
+        )
+    )
+
+    assert entries == [
+        f"filename={tmp_path / 'frame1.mrc'} x=7.0 y=4.0 index=2 xdim=4 ydim=3"
+    ]
+
+
+def test_write_annotation_entries_supports_empty_and_populated_exports(tmp_path: Path) -> None:
+    for index in range(3):
+        _write_frame(tmp_path / f"frame{index}.mrc", np.zeros((3, 4), dtype=np.float32))
+    records = scan_mrc_folder(tmp_path)
+    output = tmp_path / "coordinates.txt"
+
+    count = write_annotation_entries(output, np.empty((0, 3)), records)
     assert count == 0
-    assert output.read_text(encoding="utf-8").strip() == "filename,frame_number,x,y"
+    assert output.read_text(encoding="utf-8") == ""
 
-    count = write_annotations_csv(
+    count = write_annotation_entries(
         output,
         np.array([[0, 1.0, 2.0], [2, 3.0, 6.0]]),
         records,
     )
-    with output.open(newline="", encoding="utf-8") as input_file:
-        rows = list(csv.DictReader(input_file))
-
     assert count == 3
-    assert [row["filename"] for row in rows] == ["frame0.mrc", "frame1.mrc", "frame2.mrc"]
-    assert rows[1]["frame_number"] == "2"
-    assert rows[1]["y"] == "2.0"
-    assert rows[1]["x"] == "4.0"
+    assert output.read_text(encoding="utf-8").splitlines() == [
+        f"filename={tmp_path / 'frame0.mrc'} x=2.0 y=1.0 index=1 xdim=4 ydim=3",
+        f"filename={tmp_path / 'frame1.mrc'} x=4.0 y=2.0 index=2 xdim=4 ydim=3",
+        f"filename={tmp_path / 'frame2.mrc'} x=6.0 y=3.0 index=3 xdim=4 ydim=3",
+    ]
 
 
 def test_annotation_xyz_coordinates_converts_zyx_to_xyz() -> None:
@@ -271,8 +353,8 @@ def test_annotation_xyz_coordinates_converts_zyx_to_xyz() -> None:
     )
 
 
-def test_volume_box_segments_use_full_xyz_extents() -> None:
-    segments = volume_box_segments(5, (3, 4))
+def test_bounding_box_segments_use_full_xyz_extents() -> None:
+    segments = bounding_box_segments(5, (3, 4))
 
     assert segments.shape == (24, 3)
     np.testing.assert_array_equal(segments.min(axis=0), [0, 0, 0])
@@ -343,12 +425,14 @@ def test_path_intersection_interpolates_between_frame_neighbors() -> None:
         dtype=float,
     )
 
-    np.testing.assert_allclose(path_intersection_at_frame(coordinates, 5), [5, 10, 20])
-    np.testing.assert_allclose(path_intersection_at_frame(coordinates, 15), [15, 30, 60])
-    np.testing.assert_allclose(path_intersection_at_frame(coordinates, 10), [10, 20, 40])
-    assert path_intersection_at_frame(coordinates, -1) is None
-    assert path_intersection_at_frame(coordinates, 21) is None
-    assert path_intersection_at_frame(coordinates[:1], 0) is None
+    path = SmoothedPath(coordinates)
+
+    np.testing.assert_allclose(path.at_frame(5), [5, 10, 20])
+    np.testing.assert_allclose(path.at_frame(15), [15, 30, 60])
+    np.testing.assert_allclose(path.at_frame(10), [10, 20, 40])
+    assert path.at_frame(-1) is None
+    assert path.at_frame(21) is None
+    assert SmoothedPath(coordinates[:1]).at_frame(0) is None
 
 
 def test_path_smoothness_reduces_measurement_spike() -> None:
@@ -406,7 +490,7 @@ def test_session_file_round_trip(tmp_path: Path) -> None:
 
     assert session.source_folder == tmp_path.resolve()
     np.testing.assert_array_equal(session.annotations, annotations)
-    assert session.image_count == 3
+    assert session.frame_count == 3
     assert session.first_filename == "frame0.mrc"
     assert session.last_filename == "frame2.mrc"
     assert session.frame_number == 3
@@ -423,7 +507,7 @@ def test_session_file_rejects_wrong_format(tmp_path: Path) -> None:
         read_session_file(path)
 
 
-def test_session_file_rejects_frame_outside_saved_image_count(tmp_path: Path) -> None:
+def test_session_file_rejects_frame_outside_saved_frame_count(tmp_path: Path) -> None:
     path = tmp_path / "bad-frame.json"
     path.write_text(
         '{"format":"nanotation-session","version":2,'

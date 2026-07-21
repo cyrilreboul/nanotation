@@ -6,11 +6,12 @@ Nanotation is a focused desktop application for tracing structures and motion ac
 
 As checkpoints are added, Nanotation builds a connected spatial path and displays it in an interactive 3D overview. The path is projected through the frames between checkpoints, making its progression easy to follow without requiring a point to be placed manually in every image.
 
-Nanotation is designed to remain responsive with exceptionally large datasets. Images are opened only as they are viewed, so long time-series can be explored without loading the entire collection into memory.
+Nanotation is designed to remain responsive with exceptionally large datasets. Images are opened only as they are viewed, so long time-series can be explored without loading the entire collection into memory or creating automatic index files.
 
 ## Highlights
 
 - Seamless navigation through naturally ordered MRC frames
+- Refreshing preserves checkpoints for retained files and drops those for removed files
 - Precise checkpoint placement with EMAN2-style image orientation
 - Smooth path estimation between annotated frames
 - Adjustable path smoothing for treating checkpoints as experimental measurements
@@ -18,7 +19,7 @@ Nanotation is designed to remain responsive with exceptionally large datasets. I
 - Direct navigation from a 3D checkpoint to its corresponding frame
 - Adjustable contrast through a compact interactive histogram
 - Session saving and restoration for long-running annotation work
-- Clean CSV export for downstream analysis
+- Clean space-delimited text export for downstream analysis
 
 ## Typical Workflow
 
@@ -57,12 +58,10 @@ Use **Save Session…** to preserve the source folder, checkpoints, path smoothn
 
 ## Coordinate Export
 
-Nanotation exports one CSV row for each frame containing either a checkpoint or a smoothed path position:
+Nanotation exports one text entry for each frame containing either a checkpoint or a smoothed path position. Each line uses space-delimited `key=value` fields:
 
-| Column | Description |
-|---|---|
-| `filename` | MRC file associated with the frame |
-| `frame_number` | One-based frame number |
-| `x`, `y` | Base-zero image coordinates, measured from the bottom-left origin |
+```text
+filename=/data/experiment/frame0001.mrc x=120.0 y=84.0 index=1 xdim=4096 ydim=4096
+```
 
-The exported path is ready for analysis, visualization, or integration into a larger processing workflow.
+`filename` contains the full absolute path to the source MRC frame. `x` and `y` are base-zero coordinates measured from the bottom-left origin. `index` is the one-based frame index, while `xdim` and `ydim` describe the frame dimensions.

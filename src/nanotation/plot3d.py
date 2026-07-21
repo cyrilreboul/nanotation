@@ -8,16 +8,16 @@ from .annotations import annotation_xyz_coordinates, dashed_neighbor_segments
 
 
 ANNOTATION_PLOT_SIZE = (400, 450)
-ANNOTATION_MARKER_SIZE = 14
-ANNOTATION_MARKER_FACE_COLOR = (0.0, 0.333, 1.0, 0.75)
-ANNOTATION_MARKER_EDGE_COLOR = (0.5, 0.8, 1.0, 1.0)
+CHECKPOINT_MARKER_SIZE = 14
+CHECKPOINT_MARKER_FACE_COLOR = (0.0, 0.333, 1.0, 0.75)
+CHECKPOINT_MARKER_EDGE_COLOR = (0.5, 0.8, 1.0, 1.0)
 
 
-def volume_box_segments(image_count: int, image_shape: tuple[int, int]) -> np.ndarray:
+def bounding_box_segments(frame_count: int, image_shape: tuple[int, int]) -> np.ndarray:
     height, width = image_shape
     x_extent = max(1, width - 1)
     y_extent = max(1, height - 1)
-    z_extent = max(1, image_count - 1)
+    z_extent = max(1, frame_count - 1)
     corners = np.array(
         [
             [0, 0, 0],
@@ -86,7 +86,7 @@ class Annotation3DPlot(QWidget):
         from vispy import scene
 
         self._scene = scene
-        self._volume_shape: tuple[int, int, int] | None = None
+        self._time_series_shape: tuple[int, int, int] | None = None
         self._xyz = np.empty((0, 3), dtype=np.float32)
         self._mouse_press_position: tuple[float, float] | None = None
         self._selection_handled_on_press = False
@@ -149,16 +149,16 @@ class Annotation3DPlot(QWidget):
         self._markers.interactive = True
         self._markers.events.mouse_press.connect(self._on_marker_mouse_press)
 
-    def set_volume_shape(self, image_count: int, image_shape: tuple[int, int]) -> None:
+    def set_time_series_shape(self, frame_count: int, image_shape: tuple[int, int]) -> None:
         height, width = image_shape
-        volume_shape = (int(image_count), int(height), int(width))
-        if volume_shape == self._volume_shape:
+        time_series_shape = (int(frame_count), int(height), int(width))
+        if time_series_shape == self._time_series_shape:
             return
-        self._volume_shape = volume_shape
+        self._time_series_shape = time_series_shape
 
         x_extent = max(1, width - 1)
         y_extent = max(1, height - 1)
-        z_extent = max(1, image_count - 1)
+        z_extent = max(1, frame_count - 1)
         self._camera.set_range(
             x=(0, x_extent),
             y=(0, y_extent),
@@ -166,7 +166,7 @@ class Annotation3DPlot(QWidget):
             margin=0.08,
         )
         self._bounding_box.set_data(
-            pos=volume_box_segments(image_count, image_shape),
+            pos=bounding_box_segments(frame_count, image_shape),
             connect="segments",
         )
         axis_size = max(x_extent, y_extent, z_extent) * 0.12
@@ -176,10 +176,10 @@ class Annotation3DPlot(QWidget):
         self.set_frame_index(0)
 
     def set_frame_index(self, frame_index: int) -> None:
-        if self._volume_shape is None:
+        if self._time_series_shape is None:
             return
-        image_count, height, width = self._volume_shape
-        index = min(max(0, int(frame_index)), max(0, image_count - 1))
+        frame_count, height, width = self._time_series_shape
+        index = min(max(0, int(frame_index)), max(0, frame_count - 1))
         self._frame_label.setText(f"Frame: {index + 1}")
         self._frame_label.adjustSize()
 
@@ -219,9 +219,9 @@ class Annotation3DPlot(QWidget):
     def _set_marker_data(self, xyz: np.ndarray) -> None:
         self._markers.set_data(
             xyz,
-            size=ANNOTATION_MARKER_SIZE,
-            face_color=ANNOTATION_MARKER_FACE_COLOR,
-            edge_color=ANNOTATION_MARKER_EDGE_COLOR,
+            size=CHECKPOINT_MARKER_SIZE,
+            face_color=CHECKPOINT_MARKER_FACE_COLOR,
+            edge_color=CHECKPOINT_MARKER_EDGE_COLOR,
             edge_width=1,
         )
 

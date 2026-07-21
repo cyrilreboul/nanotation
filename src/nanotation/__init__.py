@@ -1,4 +1,4 @@
-"""Napari desktop app for MRC volume viewing and point annotation."""
+"""Nanotation desktop app for MRC time-series path annotation."""
 
 __all__ = ["__version__"]
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import csv
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +9,6 @@ from scipy.interpolate import UnivariateSpline
 from .mrc_io import MrcFrameRecord
 
 
-CSV_FIELDNAMES = ("filename", "frame_number", "x", "y")
 DEFAULT_PATH_SMOOTHNESS = 0.15
 SMOOTHNESS_MAX_NORMALIZED_RMS = 0.02
 
@@ -109,7 +107,14 @@ class SmoothedPath:
         interval_count = len(self._frames) - 1
         sample_count = min(max_samples, max(2, interval_count * samples_per_interval + 1))
         frames = np.linspace(self._frames[0], self._frames[-1], sample_count)
-        return np.asarray([self.at_frame(frame) for frame in frames], dtype=float)
+        if self._y_spline is None or self._x_spline is None:
+            y_values = np.interp(frames, self._frames, self._y_values)
+            x_values = np.interp(frames, self._frames, self._x_values)
+        else:
+            normalized_frames = self._normalize_frames(frames)
+            y_values = self._y_origin + self._y_scale * self._y_spline(normalized_frames)
+            x_values = self._x_origin + self._x_scale * self._x_spline(normalized_frames)
+        return np.column_stack((frames, y_values, x_values)).astype(float, copy=False)
 
     def _normalize_frames(self, frames):
         return (frames - self._frame_origin) / self._frame_scale
@@ -122,16 +127,16 @@ def _validated_smoothness(smoothness: float) -> float:
     return value
 
 
-def annotation_rows(
+def iter_annotation_entries(
     coordinates: np.ndarray,
     records: Sequence[MrcFrameRecord],
     smoothness: float = DEFAULT_PATH_SMOOTHNESS,
-) -> list[dict[str, object]]:
-    """Convert checkpoint and intersection coordinates into frame-wise export rows."""
+) -> Iterator[str]:
+    """Yield space-delimited checkpoint and path entries in frame order."""
 
     points = np.asarray(coordinates, dtype=float)
     if points.size == 0:
-        return []
+        return
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("Annotation coordinates must be an N x 3 array in z-y-x order.")
     if not np.isfinite(points).all():
@@ -141,7 +146,10 @@ def annotation_rows(
     for point_id, frame_index in enumerate(point_frame_indices, start=1):
         if frame_index < 0 or frame_index >= len(records):
             z_value = points[point_id - 1, 0]
-            raise ValueError(f"Point {point_id} is outside the loaded volume (z={z_value:g}).")
+            raise ValueError(
+                f"Point {point_id} is outside the loaded time-series "
+                f"(frame coordinate={z_value:g})."
+            )
 
     frame_indices = set(int(frame_index) for frame_index in point_frame_indices)
     if len(points) >= 2:
@@ -150,36 +158,33 @@ def annotation_rows(
         frame_indices.update(range(first_frame, last_frame + 1))
 
     path = SmoothedPath(points, smoothness, records[0].shape)
-    rows: list[dict[str, object]] = []
+    y_dimension, x_dimension = records[0].shape
     for frame_index in sorted(frame_indices):
         coordinate = path.at_frame(frame_index)
         if coordinate is None:
             coordinate = points[point_frame_indices == frame_index].mean(axis=0)
             coordinate[0] = frame_index
-        _z_value, y_value, x_value = coordinate
-        rows.append(
-            {
-                "filename": records[frame_index].name,
-                "frame_number": frame_index + 1,
-                "x": float(x_value),
-                "y": float(y_value),
-            }
+        y_value, x_value = coordinate[1:]
+        yield (
+            f"filename={records[frame_index].path.resolve()} "
+            f"x={float(x_value)} y={float(y_value)} index={frame_index + 1} "
+            f"xdim={x_dimension} ydim={y_dimension}"
         )
-    return rows
 
 
-def write_annotations_csv(
+def write_annotation_entries(
     path: Path,
     coordinates: np.ndarray,
     records: Sequence[MrcFrameRecord],
     smoothness: float = DEFAULT_PATH_SMOOTHNESS,
 ) -> int:
-    rows = annotation_rows(coordinates, records, smoothness)
-    with path.open("w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=CSV_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
-    return len(rows)
+    entry_count = 0
+    with path.open("w", encoding="utf-8") as output:
+        for entry in iter_annotation_entries(coordinates, records, smoothness):
+            output.write(entry)
+            output.write("\n")
+            entry_count += 1
+    return entry_count
 
 
 def annotation_xyz_coordinates(coordinates: np.ndarray) -> np.ndarray:
@@ -222,12 +227,3 @@ def dashed_neighbor_segments(
                 )
             )
     return np.asarray(segments, dtype=np.float32)
-
-
-def path_intersection_at_frame(
-    zyx_coordinates: np.ndarray,
-    frame_index: int,
-    smoothness: float = DEFAULT_PATH_SMOOTHNESS,
-    image_shape: tuple[int, int] | None = None,
-) -> np.ndarray | None:
-    return SmoothedPath(zyx_coordinates, smoothness, image_shape).at_frame(frame_index)

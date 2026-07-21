@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nanotation"
 version = "0.1.0"
-description = "Standalone napari app for MRC volume annotation."
+description = "Desktop app for tracing paths through MRC time-series."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

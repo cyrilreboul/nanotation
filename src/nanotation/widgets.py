@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import csv
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import QTimer, Qt, Signal
-from qtpy.QtGui import QColor, QPainter, QPen
+from qtpy.QtCore import QTimer, Qt
 from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
@@ -19,270 +18,104 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .annotations import DEFAULT_PATH_SMOOTHNESS, SmoothedPath, write_annotations_csv
-from .mrc_io import LazyMrcVolume, MrcFrameRecord, scan_mrc_folder, volume_scale
+from .annotations import DEFAULT_PATH_SMOOTHNESS, SmoothedPath, write_annotation_entries
+from .histogram import (
+    HistogramWidget,
+    finite_intensity_standard_deviation,
+    standard_deviation_limits,
+)
+from .mrc_io import LazyMrcTimeSeries, MrcFrameRecord, scan_mrc_folder, time_series_scale
+from .napari_ui import (
+    apply_eman2_image_orientation,
+    hide_layer_controls,
+    set_default_image_interpolation,
+    set_frame_axis_label,
+    update_frame_slider_labels,
+)
 from .plot3d import Annotation3DPlot
 from .sessions import NanotationSession, read_session_file, write_session_file
 
 
-VOLUME_LAYER_NAME = "MRC volume"
+IMAGE_LAYER_NAME = "MRC time-series"
 POINTS_LAYER_NAME = "Path checkpoints"
-INTERSECTION_LAYER_NAME = "Linear path"
+INTERSECTION_LAYER_NAME = "Smooth path"
 POINT_BORDER_COLOR = "#0055ffff"
 POINT_OPACITY = 0.6
-POINT_SIZE = 32
+IMAGE_CHECKPOINT_SIZE = 32
 INTERSECTION_COLOR = "#ffaa00ff"
 INTERSECTION_OPACITY = 0.4
 INTERSECTION_SIZE = 24
 ZOOM_STEP = 1.25
 MIN_ZOOM = 0.01
 MAX_ZOOM = 100.0
-DEFAULT_INTERPOLATION = "bicubic"
-EMAN2_IMAGE_ORIENTATION_2D = ("up", "right")
-HISTOGRAM_BINS = 96
 INITIAL_DISPLAY_STD_MULTIPLIER = 5.0
 INITIAL_CONTRAST_LOW_STD_MULTIPLIER = -3.0
 INITIAL_CONTRAST_HIGH_STD_MULTIPLIER = 4.0
 
 
-def finite_intensity_standard_deviation(values: np.ndarray | None) -> float | None:
-    data = np.asarray(values, dtype=float)
-    if data.size == 0:
+@dataclass(frozen=True, slots=True)
+class _RefreshAnnotations:
+    source_folder: Path
+    checkpoints: tuple[tuple[str, float, float], ...]
+
+
+def _capture_refresh_annotations(
+    coordinates: np.ndarray,
+    records: Sequence[MrcFrameRecord],
+) -> _RefreshAnnotations | None:
+    data = np.asarray(coordinates, dtype=float)
+    if not records or data.ndim != 2 or data.shape[1] != 3:
         return None
-    finite = data[np.isfinite(data)]
-    if finite.size == 0:
+
+    checkpoints = []
+    for frame_value, y_value, x_value in data:
+        if not np.all(np.isfinite((frame_value, y_value, x_value))):
+            continue
+        frame_index = int(round(frame_value))
+        if 0 <= frame_index < len(records):
+            checkpoints.append(
+                (records[frame_index].name, float(y_value), float(x_value))
+            )
+    if not checkpoints:
         return None
-    standard_deviation = float(finite.std())
-    return standard_deviation if np.isfinite(standard_deviation) else None
+    return _RefreshAnnotations(records[0].path.parent.resolve(), tuple(checkpoints))
 
 
-def finite_symmetric_standard_deviation_limits(
-    values: np.ndarray | None,
-    multiplier: float,
-) -> tuple[float, float] | None:
-    return finite_standard_deviation_limits(values, -float(multiplier), float(multiplier))
+def _remap_refresh_annotations(
+    annotations: _RefreshAnnotations,
+    records: Sequence[MrcFrameRecord],
+) -> tuple[np.ndarray, int]:
+    if not records or records[0].path.parent.resolve() != annotations.source_folder:
+        return np.empty((0, 3), dtype=float), len(annotations.checkpoints)
+
+    wanted_names = {checkpoint[0] for checkpoint in annotations.checkpoints}
+    frame_indices = {
+        record.name: frame_index
+        for frame_index, record in enumerate(records)
+        if record.name in wanted_names
+    }
+    remapped = [
+        (frame_indices[filename], y_value, x_value)
+        for filename, y_value, x_value in annotations.checkpoints
+        if filename in frame_indices
+    ]
+    coordinates = (
+        np.asarray(remapped, dtype=float)
+        if remapped
+        else np.empty((0, 3), dtype=float)
+    )
+    return coordinates, len(annotations.checkpoints) - len(remapped)
 
 
-def finite_standard_deviation_limits(
-    values: np.ndarray | None,
-    low_multiplier: float,
-    high_multiplier: float,
-) -> tuple[float, float] | None:
-    standard_deviation = finite_intensity_standard_deviation(values)
-    if standard_deviation is None:
-        return None
-    low_multiplier = float(low_multiplier)
-    high_multiplier = float(high_multiplier)
-    if (
-        not np.isfinite(low_multiplier)
-        or not np.isfinite(high_multiplier)
-        or high_multiplier <= low_multiplier
-    ):
-        return None
-    if standard_deviation <= 0:
-        return -1.0, 1.0
-    return low_multiplier * standard_deviation, high_multiplier * standard_deviation
-
-
-class HistogramWidget(QWidget):
-    """Compact histogram for the currently displayed image frame."""
-
-    contrast_changed = Signal(float, float)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._counts = np.empty(0, dtype=float)
-        self._edges = np.empty(0, dtype=float)
-        self._contrast_low: float | None = None
-        self._contrast_high: float | None = None
-        self._dragging_threshold: str | None = None
-        self.setMinimumHeight(90)
-        self.setMouseTracking(True)
-
-    def set_histogram(
-        self,
-        values: np.ndarray | None,
-        *,
-        contrast_low: float | None = None,
-        contrast_high: float | None = None,
-        display_range: tuple[float, float] | None = None,
-    ) -> None:
-        self._contrast_low = contrast_low
-        self._contrast_high = contrast_high
-        if values is None:
-            self._counts = np.empty(0, dtype=float)
-            self._edges = np.empty(0, dtype=float)
-            self.update()
-            return
-
-        data = np.asarray(values, dtype=float)
-        data = data[np.isfinite(data)]
-        if data.size == 0:
-            self._counts = np.empty(0, dtype=float)
-            self._edges = np.empty(0, dtype=float)
-            self.update()
-            return
-
-        data_min = float(data.min())
-        data_max = float(data.max())
-        if display_range is not None:
-            display_low, display_high = (float(display_range[0]), float(display_range[1]))
-            if (
-                np.isfinite(display_low)
-                and np.isfinite(display_high)
-                and display_high > display_low
-            ):
-                data_min, data_max = display_low, display_high
-        if data_min == data_max:
-            padding = max(abs(data_min) * 0.001, 0.5)
-            data_min -= padding
-            data_max += padding
-        counts, edges = np.histogram(data, bins=HISTOGRAM_BINS, range=(data_min, data_max))
-        self._counts = counts.astype(float)
-        self._edges = edges.astype(float)
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
-        painter.fillRect(self.rect(), QColor("#202124"))
-
-        plot_rect = self._plot_rect()
-        painter.setPen(QPen(QColor("#5f6368"), 1))
-        painter.drawRect(plot_rect)
-
-        if self._counts.size == 0 or self._edges.size < 2:
-            painter.setPen(QColor("#c7c7c7"))
-            painter.drawText(plot_rect, Qt.AlignCenter, "No frame histogram")
-            painter.end()
-            return
-
-        maximum = float(self._counts.max())
-        if maximum > 0:
-            bar_width = plot_rect.width() / self._counts.size
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#9aa0a6"))
-            for index, count in enumerate(self._counts):
-                height = int((count / maximum) * max(1, plot_rect.height() - 2))
-                x = int(plot_rect.left() + index * bar_width)
-                y = int(plot_rect.bottom() - height)
-                painter.drawRect(x, y, max(1, int(np.ceil(bar_width))), height)
-
-        self._draw_threshold_line(painter, self._contrast_low, QColor("#ffffff"))
-        self._draw_threshold_line(painter, self._contrast_high, QColor("#ffcc00"))
-
-        painter.end()
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() != Qt.LeftButton:
-            super().mousePressEvent(event)
-            return
-        threshold = self._threshold_near_position(self._event_x(event))
-        if threshold is None:
-            super().mousePressEvent(event)
-            return
-        self._dragging_threshold = threshold
-        self._set_dragged_threshold(self._event_x(event))
-        event.accept()
-
-    def mouseMoveEvent(self, event) -> None:
-        if self._dragging_threshold is not None:
-            self._set_dragged_threshold(self._event_x(event))
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:
-        if self._dragging_threshold is None:
-            super().mouseReleaseEvent(event)
-            return
-        self._set_dragged_threshold(self._event_x(event))
-        self._dragging_threshold = None
-        event.accept()
-
-    def _draw_threshold_line(self, painter, value: float | None, color: QColor) -> None:
-        x = self._value_to_x(value)
-        if x is None:
-            return
-        plot_rect = self._plot_rect()
-        painter.setPen(QPen(color, 2))
-        painter.drawLine(x, plot_rect.top(), x, plot_rect.bottom())
-
-    def _plot_rect(self):
-        return self.rect().adjusted(6, 6, -6, -6)
-
-    def _event_x(self, event) -> float:
-        position = event.position() if hasattr(event, "position") else event.pos()
-        return float(position.x())
-
-    def _value_to_x(self, value: float | None) -> int | None:
-        if value is None or self._edges.size < 2:
-            return None
-        histogram_low = float(self._edges[0])
-        histogram_high = float(self._edges[-1])
-        if histogram_high <= histogram_low:
-            return None
-        plot_rect = self._plot_rect()
-        fraction = (float(value) - histogram_low) / (histogram_high - histogram_low)
-        fraction = min(1.0, max(0.0, fraction))
-        return int(plot_rect.left() + fraction * plot_rect.width())
-
-    def _x_to_value(self, x_position: float) -> float | None:
-        if self._edges.size < 2:
-            return None
-        histogram_low = float(self._edges[0])
-        histogram_high = float(self._edges[-1])
-        if histogram_high <= histogram_low:
-            return None
-        plot_rect = self._plot_rect()
-        fraction = (float(x_position) - plot_rect.left()) / max(1, plot_rect.width())
-        fraction = min(1.0, max(0.0, fraction))
-        return histogram_low + fraction * (histogram_high - histogram_low)
-
-    def _threshold_near_position(self, x_position: float) -> str | None:
-        low_x = self._value_to_x(self._contrast_low)
-        high_x = self._value_to_x(self._contrast_high)
-        candidates = []
-        if low_x is not None:
-            candidates.append(("low", abs(float(low_x) - x_position)))
-        if high_x is not None:
-            candidates.append(("high", abs(float(high_x) - x_position)))
-        if not candidates:
-            return None
-        threshold, distance = min(candidates, key=lambda item: item[1])
-        return threshold if distance <= 12.0 else None
-
-    def _set_dragged_threshold(self, x_position: float) -> None:
-        if self._dragging_threshold is None:
-            return
-        value = self._x_to_value(x_position)
-        if value is None:
-            return
-        low = self._contrast_low
-        high = self._contrast_high
-        if low is None or high is None:
-            return
-        histogram_span = max(float(self._edges[-1] - self._edges[0]), 1.0)
-        minimum_gap = histogram_span * 1e-9
-        if self._dragging_threshold == "low":
-            low = min(float(value), float(high) - minimum_gap)
-        else:
-            high = max(float(value), float(low) + minimum_gap)
-        self._contrast_low = float(low)
-        self._contrast_high = float(high)
-        self.update()
-        self.contrast_changed.emit(float(low), float(high))
-
-
-class VolumeAnnotationWidget(QWidget):
+class NanotationWidget(QWidget):
     def __init__(self, viewer, initial_folder: Path | None = None) -> None:
         super().__init__()
         self.viewer = viewer
         self.records: Sequence[MrcFrameRecord] = []
         self._load_worker = None
         self._pending_session: NanotationSession | None = None
-        self._volume_layer = None
+        self._pending_refresh_annotations: _RefreshAnnotations | None = None
+        self._image_layer = None
         self._contrast_display_range: tuple[float, float] | None = None
         self._smoothed_path = SmoothedPath(np.empty((0, 3), dtype=float))
 
@@ -325,7 +158,7 @@ class VolumeAnnotationWidget(QWidget):
         smoothness_row.addWidget(self.path_smoothness_spin, stretch=1)
 
         self.clear_points_button = QPushButton("Clear Points")
-        self.export_button = QPushButton("Export Coordinates…")
+        self.export_button = QPushButton("Export track…")
         self.save_session_button = QPushButton("Save Session…")
         self.load_session_button = QPushButton("Load Session…")
         self.clear_points_button.setEnabled(False)
@@ -372,7 +205,7 @@ class VolumeAnnotationWidget(QWidget):
         self.viewer.camera.events.zoom.connect(self._update_zoom_label)
         self.viewer.layers.selection.events.active.connect(self._hide_napari_layer_controls)
         self.viewer.dims.events.current_step.connect(self._update_plot_frame_index)
-        self._apply_eman2_image_orientation()
+        apply_eman2_image_orientation(self.viewer)
         self._set_zoom(1.0)
 
         if initial_folder is not None:
@@ -395,6 +228,20 @@ class VolumeAnnotationWidget(QWidget):
             self._show_error("Choose a folder first.")
             return
 
+        self._pending_refresh_annotations = None
+        points = self._points_layer()
+        target_folder = Path(folder_text).expanduser().resolve()
+        current_folder = self.records[0].path.parent.resolve() if self.records else None
+        if (
+            self._pending_session is None
+            and points is not None
+            and target_folder == current_folder
+        ):
+            self._pending_refresh_annotations = _capture_refresh_annotations(
+                points.data,
+                self.records,
+            )
+
         from napari.qt.threading import thread_worker
 
         self.load_button.setEnabled(False)
@@ -403,7 +250,7 @@ class VolumeAnnotationWidget(QWidget):
         self.load_session_button.setEnabled(False)
         self.summary_label.setText("Indexing MRC frames…")
         worker = thread_worker(_prepare_time_series, start_thread=False, ignore_errors=True)(
-            Path(folder_text).expanduser()
+            target_folder
         )
         worker.returned.connect(self._finish_time_series_load)
         worker.errored.connect(self._time_series_load_failed)
@@ -412,19 +259,19 @@ class VolumeAnnotationWidget(QWidget):
         worker.start()
 
     def _finish_time_series_load(self, result) -> None:
-        records, volume = result
+        records, time_series = result
 
-        self._remove_layer(VOLUME_LAYER_NAME)
+        self._remove_layer(IMAGE_LAYER_NAME)
         self._remove_layer(POINTS_LAYER_NAME)
         self._remove_layer(INTERSECTION_LAYER_NAME)
         self.records = records
-        self._volume_layer = None
+        self._image_layer = None
         self._contrast_display_range = None
-        scale = volume_scale(records)
-        self.annotation_plot.set_volume_shape(len(records), records[0].shape)
-        volume_layer = self.viewer.add_image(
-            volume,
-            name=VOLUME_LAYER_NAME,
+        scale = time_series_scale(records)
+        self.annotation_plot.set_time_series_shape(len(records), records[0].shape)
+        image_layer = self.viewer.add_image(
+            time_series,
+            name=IMAGE_LAYER_NAME,
             colormap="gray",
             scale=scale,
             metadata={
@@ -432,14 +279,14 @@ class VolumeAnnotationWidget(QWidget):
                 "frame_count": len(records),
             },
         )
-        self._volume_layer = volume_layer
-        self._set_default_interpolation(volume_layer)
+        self._image_layer = image_layer
+        set_default_image_interpolation(image_layer)
         points = self.viewer.add_points(
             np.empty((0, 3), dtype=float),
             name=POINTS_LAYER_NAME,
             ndim=3,
             scale=scale,
-            size=POINT_SIZE,
+            size=IMAGE_CHECKPOINT_SIZE,
             face_color="transparent",
             border_color=POINT_BORDER_COLOR,
             border_width=0.2,
@@ -483,9 +330,26 @@ class VolumeAnnotationWidget(QWidget):
                 self._show_error(str(exc))
             finally:
                 self._pending_session = None
+        elif self._pending_refresh_annotations is not None:
+            remapped, removed_count = _remap_refresh_annotations(
+                self._pending_refresh_annotations,
+                records,
+            )
+            points.data = remapped
+            self._update_point_count()
+            self.summary_label.setText(
+                f"Refreshed {len(records)} frames; preserved {len(remapped)} checkpoints"
+                + (
+                    f" and removed {removed_count} from deleted files"
+                    if removed_count
+                    else ""
+                )
+            )
+        self._pending_refresh_annotations = None
 
     def _time_series_load_failed(self, error: Exception) -> None:
         self._pending_session = None
+        self._pending_refresh_annotations = None
         self._show_error(str(error))
 
     def _time_series_load_finished(self) -> None:
@@ -511,17 +375,12 @@ class VolumeAnnotationWidget(QWidget):
             self.viewer.reset_view()
         elif hasattr(self.viewer, "fit_to_view"):
             self.viewer.fit_to_view()
-        self._apply_eman2_image_orientation()
+        apply_eman2_image_orientation(self.viewer)
         self._set_zoom(1.0)
 
     def _set_zoom(self, zoom: float) -> None:
         self.viewer.camera.zoom = min(MAX_ZOOM, max(MIN_ZOOM, float(zoom)))
         self._update_zoom_label()
-
-    def _apply_eman2_image_orientation(self) -> None:
-        camera = getattr(self.viewer, "camera", None)
-        if camera is not None and hasattr(camera, "orientation2d"):
-            camera.orientation2d = EMAN2_IMAGE_ORIENTATION_2D
 
     def _update_zoom_label(self, event=None) -> None:
         del event
@@ -536,37 +395,14 @@ class VolumeAnnotationWidget(QWidget):
             self.viewer.dims.current_step = (0, *current_step[1:])
 
     def _configure_frame_controls(self) -> None:
-        axis_labels = list(getattr(self.viewer.dims, "axis_labels", ()))
-        if axis_labels:
-            axis_labels[0] = "Frame"
-            self.viewer.dims.axis_labels = tuple(axis_labels)
+        set_frame_axis_label(self.viewer)
         QTimer.singleShot(0, self._update_frame_slider_labels)
 
     def _update_frame_slider_labels(self) -> None:
         frame_index = self._current_frame_index()
         if frame_index is None:
             return
-        qt_viewer = getattr(getattr(self.viewer, "window", None), "_qt_viewer", None)
-        qt_dims = getattr(qt_viewer, "dims", None)
-        slider_widgets = getattr(qt_dims, "slider_widgets", ())
-        if not slider_widgets:
-            return
-        frame_slider = slider_widgets[0]
-        current_label = getattr(frame_slider, "curslice_label", None)
-        total_label = getattr(frame_slider, "totslice_label", None)
-        if current_label is None or total_label is None:
-            return
-        current_label.setReadOnly(True)
-        current_label.setText(str(frame_index + 1))
-        total_label.setText(str(len(self.records)))
-        width = current_label.fontMetrics().horizontalAdvance("8" * len(str(len(self.records)))) + 6
-        current_label.setFixedWidth(width)
-        total_label.setFixedWidth(width)
-
-    def _set_default_interpolation(self, layer) -> None:
-        for attribute in ("interpolation2d", "interpolation3d"):
-            if hasattr(layer, attribute):
-                setattr(layer, attribute, DEFAULT_INTERPOLATION)
+        update_frame_slider_labels(self.viewer, frame_index, len(self.records))
 
     def _current_frame_index(self) -> int | None:
         if not self.records:
@@ -577,24 +413,29 @@ class VolumeAnnotationWidget(QWidget):
         return min(max(0, int(current_step[0])), len(self.records) - 1)
 
     def _current_frame_data(self) -> np.ndarray | None:
-        if self._volume_layer is None:
+        if self._image_layer is None:
             return None
         frame_index = self._current_frame_index()
         if frame_index is None:
             return None
         try:
-            return np.asarray(self._volume_layer.data[frame_index])
+            return np.asarray(self._image_layer.data[frame_index])
         except (IndexError, OSError, ValueError):
             return None
 
     def _set_initial_contrast_from_current_frame(self) -> None:
         data = self._current_frame_data()
-        display_range = finite_symmetric_standard_deviation_limits(
-            data,
+        standard_deviation = finite_intensity_standard_deviation(data)
+        if standard_deviation is None:
+            self.histogram_widget.set_histogram(None)
+            return
+        display_range = standard_deviation_limits(
+            standard_deviation,
+            -INITIAL_DISPLAY_STD_MULTIPLIER,
             INITIAL_DISPLAY_STD_MULTIPLIER,
         )
-        contrast_limits = finite_standard_deviation_limits(
-            data,
+        contrast_limits = standard_deviation_limits(
+            standard_deviation,
             INITIAL_CONTRAST_LOW_STD_MULTIPLIER,
             INITIAL_CONTRAST_HIGH_STD_MULTIPLIER,
         )
@@ -605,18 +446,18 @@ class VolumeAnnotationWidget(QWidget):
         self._set_contrast_limits(*contrast_limits)
 
     def _set_contrast_display_range(self, low: float, high: float) -> None:
-        if self._volume_layer is None:
+        if self._image_layer is None:
             return
         low = float(low)
         high = float(high)
         if not np.isfinite(low) or not np.isfinite(high) or high <= low:
             return
         self._contrast_display_range = (low, high)
-        if hasattr(self._volume_layer, "contrast_limits_range"):
-            self._volume_layer.contrast_limits_range = (low, high)
+        if hasattr(self._image_layer, "contrast_limits_range"):
+            self._image_layer.contrast_limits_range = (low, high)
 
     def _set_contrast_limits(self, low: float, high: float) -> None:
-        if self._volume_layer is None:
+        if self._image_layer is None:
             return
         low = float(low)
         high = float(high)
@@ -624,22 +465,22 @@ class VolumeAnnotationWidget(QWidget):
             return
         if high <= low:
             high = low + max(abs(low) * 1e-6, 1e-6)
-        self._volume_layer.contrast_limits = (low, high)
+        self._image_layer.contrast_limits = (low, high)
         self._update_current_frame_histogram()
 
     def _contrast_limits(self) -> tuple[float | None, float | None]:
-        if self._volume_layer is None:
+        if self._image_layer is None:
             return None, None
         try:
-            low, high = self._volume_layer.contrast_limits
+            low, high = self._image_layer.contrast_limits
         except (TypeError, ValueError):
             return None, None
         return float(low), float(high)
 
     def _contrast_display_limits_range(self) -> tuple[float, float] | None:
-        if self._volume_layer is not None and hasattr(self._volume_layer, "contrast_limits_range"):
+        if self._image_layer is not None and hasattr(self._image_layer, "contrast_limits_range"):
             try:
-                low, high = self._volume_layer.contrast_limits_range
+                low, high = self._image_layer.contrast_limits_range
                 low = float(low)
                 high = float(high)
                 if np.isfinite(low) and np.isfinite(high) and high > low:
@@ -659,49 +500,7 @@ class VolumeAnnotationWidget(QWidget):
 
     def _hide_napari_layer_controls(self, event=None) -> None:
         del event
-        qt_viewer = getattr(getattr(self.viewer, "window", None), "_qt_viewer", None)
-        controls_container = getattr(qt_viewer, "controls", None)
-        controls_widgets = []
-        controls = getattr(controls_container, "currentWidget", lambda: None)()
-        if controls is not None:
-            controls_widgets.append(controls)
-        controls_widgets.extend(getattr(controls_container, "widgets", {}).values())
-        controls_to_hide = {
-            "_opacity_blending_controls": (
-                "blend_combobox",
-                "blend_label",
-            ),
-            "_projection_mode_control": (
-                "projection_combobox",
-                "projection_combobox_label",
-            ),
-            "_text_visibility_control": (
-                "text_disp_checkbox",
-                "text_disp_label",
-            ),
-            "_out_slice_checkbox_control": (
-                "out_of_slice_checkbox",
-                "out_of_slice_checkbox_label",
-            ),
-        }
-        for controls_widget in controls_widgets:
-            self._hide_widget_controls(controls_widget, controls_to_hide)
-
-    def _hide_widget_controls(
-        self,
-        controls,
-        control_widgets: dict[str, tuple[str, ...]],
-    ) -> None:
-        if controls is None:
-            return
-        for control_name, widget_names in control_widgets.items():
-            control = getattr(controls, control_name, None)
-            if control is None:
-                continue
-            for widget_name in widget_names:
-                widget = getattr(control, widget_name, None)
-                if widget is not None:
-                    widget.setVisible(False)
+        hide_layer_controls(self.viewer)
 
     def _update_plot_frame_index(self, event=None) -> None:
         del event
@@ -753,12 +552,12 @@ class VolumeAnnotationWidget(QWidget):
             return
 
         initial_path = self.records[0].path.parent / "nanotation-session.nanotation.json"
-        filename, _selected_filter = QFileDialog.getSaveFileName(
+        filename = QFileDialog.getSaveFileName(
             self,
             "Save Nanotation session",
             str(initial_path),
             "Nanotation sessions (*.nanotation.json);;JSON files (*.json)",
-        )
+        )[0]
         if not filename:
             return
 
@@ -784,12 +583,12 @@ class VolumeAnnotationWidget(QWidget):
 
     def _load_session(self) -> None:
         initial_folder = self.folder_edit.text().strip() or str(Path.home())
-        filename, _selected_filter = QFileDialog.getOpenFileName(
+        filename = QFileDialog.getOpenFileName(
             self,
             "Load Nanotation session",
             initial_folder,
             "Nanotation sessions (*.nanotation.json *.json);;All files (*)",
-        )
+        )[0]
         if not filename:
             return
         try:
@@ -806,9 +605,9 @@ class VolumeAnnotationWidget(QWidget):
         self.load_time_series()
 
     def _restore_session(self, session: NanotationSession, points) -> None:
-        if session.image_count != len(self.records):
+        if session.frame_count != len(self.records):
             raise ValueError(
-                f"Session expects {session.image_count} images, but the folder contains "
+                f"Session expects {session.frame_count} frames, but the folder contains "
                 f"{len(self.records)}."
             )
         if (
@@ -820,7 +619,7 @@ class VolumeAnnotationWidget(QWidget):
         if frame_indices.size and (
             np.any(frame_indices < 0) or np.any(frame_indices >= len(self.records))
         ):
-            raise ValueError("The session contains annotations outside the loaded image volume.")
+            raise ValueError("The session contains annotations outside the loaded time-series.")
         if session.frame_number > len(self.records):
             raise ValueError("The saved frame number is outside the loaded time-series.")
 
@@ -856,30 +655,30 @@ class VolumeAnnotationWidget(QWidget):
             self._show_error("Load a time-series before exporting coordinates.")
             return
 
-        initial_path = Path(self.folder_edit.text()).expanduser() / "annotations.csv"
-        filename, _selected_filter = QFileDialog.getSaveFileName(
+        initial_path = Path(self.folder_edit.text()).expanduser() / "annotations.txt"
+        filename = QFileDialog.getSaveFileName(
             self,
-            "Export annotation coordinates",
+            "Export track",
             str(initial_path),
-            "CSV files (*.csv)",
-        )
+            "Text files (*.txt)",
+        )[0]
         if not filename:
             return
 
         path = Path(filename)
-        if path.suffix.lower() != ".csv":
-            path = path.with_suffix(".csv")
+        if path.suffix.lower() != ".txt":
+            path = path.with_suffix(".txt")
         try:
-            count = write_annotations_csv(
+            count = write_annotation_entries(
                 path,
                 points.data,
                 self.records,
                 self.path_smoothness_spin.value(),
             )
-        except (OSError, ValueError, csv.Error) as exc:
+        except (OSError, ValueError) as exc:
             self._show_error(str(exc))
             return
-        self.summary_label.setText(f"Exported {count} coordinate rows to {path}")
+        self.summary_label.setText(f"Exported {count} track entries to {path}")
 
     def _update_point_count(self, event=None) -> None:
         del event
@@ -912,6 +711,8 @@ class VolumeAnnotationWidget(QWidget):
         QMessageBox.critical(self, "Nanotation", message)
 
 
-def _prepare_time_series(folder: Path) -> tuple[Sequence[MrcFrameRecord], LazyMrcVolume]:
-    records = scan_mrc_folder(folder, recursive=False)
-    return records, LazyMrcVolume(records)
+def _prepare_time_series(
+    folder: Path,
+) -> tuple[Sequence[MrcFrameRecord], LazyMrcTimeSeries]:
+    records = scan_mrc_folder(folder)
+    return records, LazyMrcTimeSeries(records)
