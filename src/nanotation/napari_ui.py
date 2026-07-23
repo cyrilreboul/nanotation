@@ -70,6 +70,9 @@ def hide_layer_controls(viewer) -> None:
 def _hide_widget_controls(controls) -> None:
     if controls is None:
         return
+    transform_button = getattr(controls, "transform_button", None)
+    if transform_button is not None:
+        transform_button.setVisible(False)
     for control_name, widget_names in LAYER_CONTROLS_TO_HIDE.items():
         control = getattr(controls, control_name, None)
         if control is None:

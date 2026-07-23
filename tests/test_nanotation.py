@@ -25,10 +25,12 @@ from nanotation.mrc_io import (
 from nanotation.napari_ui import (
     DEFAULT_INTERPOLATION,
     EMAN2_IMAGE_ORIENTATION_2D,
+    _hide_widget_controls,
     apply_eman2_image_orientation,
     set_default_image_interpolation,
 )
 from nanotation.plot3d import (
+    ANNOTATION_PLOT_SIZE,
     CHECKPOINT_MARKER_SIZE,
     bounding_box_segments,
     homogeneous_canvas_positions,
@@ -252,6 +254,23 @@ def test_default_image_interpolation_is_bicubic() -> None:
 def test_default_checkpoint_sizes_are_distinct_for_image_and_3d_views() -> None:
     assert IMAGE_CHECKPOINT_SIZE == 32
     assert CHECKPOINT_MARKER_SIZE == 14
+    assert ANNOTATION_PLOT_SIZE == (400, 500)
+
+
+def test_layer_controls_hide_transform_button() -> None:
+    class Button:
+        visible = True
+
+        def setVisible(self, visible: bool) -> None:
+            self.visible = visible
+
+    class Controls:
+        transform_button = Button()
+
+    controls = Controls()
+    _hide_widget_controls(controls)
+
+    assert controls.transform_button.visible is False
 
 
 def test_finite_intensity_standard_deviation_ignores_nonfinite_values() -> None:

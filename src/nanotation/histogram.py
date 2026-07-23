@@ -99,8 +99,7 @@ class HistogramWidget(QWidget):
         self._edges = edges.astype(float)
         self.update()
 
-    def paintEvent(self, event) -> None:
-        del event
+    def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.fillRect(self.rect(), QColor("#202124"))

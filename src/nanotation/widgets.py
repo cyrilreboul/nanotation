@@ -45,7 +45,6 @@ IMAGE_CHECKPOINT_SIZE = 32
 INTERSECTION_COLOR = "#ffaa00ff"
 INTERSECTION_OPACITY = 0.4
 INTERSECTION_SIZE = 24
-ZOOM_STEP = 1.25
 MIN_ZOOM = 0.01
 MAX_ZOOM = 100.0
 INITIAL_DISPLAY_STD_MULTIPLIER = 5.0
@@ -135,15 +134,7 @@ class NanotationWidget(QWidget):
         self.annotation_plot = Annotation3DPlot()
 
         self.zoom_label = QLabel("Zoom: 1.00x")
-        self.zoom_out_button = QPushButton("Zoom Out")
         self.zoom_reset_button = QPushButton("Zoom 1:1")
-        self.zoom_in_button = QPushButton("Zoom In")
-
-        zoom_row = QHBoxLayout()
-        zoom_row.addWidget(self.zoom_label, stretch=1)
-        zoom_row.addWidget(self.zoom_out_button)
-        zoom_row.addWidget(self.zoom_reset_button)
-        zoom_row.addWidget(self.zoom_in_button)
 
         self.histogram_widget = HistogramWidget()
 
@@ -156,6 +147,8 @@ class NanotationWidget(QWidget):
         smoothness_row = QHBoxLayout()
         smoothness_row.addWidget(QLabel("Path Smoothness"))
         smoothness_row.addWidget(self.path_smoothness_spin, stretch=1)
+        smoothness_row.addWidget(self.zoom_label)
+        smoothness_row.addWidget(self.zoom_reset_button)
 
         self.clear_points_button = QPushButton("Clear Points")
         self.export_button = QPushButton("Export track…")
@@ -169,22 +162,14 @@ class NanotationWidget(QWidget):
         session_row.addWidget(self.save_session_button)
         session_row.addWidget(self.load_session_button)
 
-        instructions = QLabel(
-            "Scroll with the frame control, then click locations "
-            "in any frame. Coordinates can be exported whenever needed."
-        )
-        instructions.setWordWrap(True)
-
         layout = QVBoxLayout()
         layout.addLayout(folder_row)
         layout.addWidget(self.load_button)
         layout.addWidget(self.summary_label)
         layout.addWidget(self.annotation_plot)
         layout.addWidget(self.clear_points_button)
-        layout.addLayout(zoom_row)
         layout.addWidget(self.histogram_widget)
         layout.addLayout(smoothness_row)
-        layout.addWidget(instructions)
         layout.addWidget(self.export_button)
         layout.addLayout(session_row)
         layout.addStretch(1)
@@ -192,11 +177,9 @@ class NanotationWidget(QWidget):
 
         self.browse_button.clicked.connect(self._browse)
         self.load_button.clicked.connect(self.load_time_series)
-        self.zoom_out_button.clicked.connect(self._zoom_out)
         self.zoom_reset_button.clicked.connect(self._reset_zoom)
-        self.zoom_in_button.clicked.connect(self._zoom_in)
         self.histogram_widget.contrast_changed.connect(self._set_contrast_limits)
-        self.path_smoothness_spin.valueChanged.connect(self._path_smoothness_changed)
+        self.path_smoothness_spin.valueChanged.connect(self._update_point_count)
         self.clear_points_button.clicked.connect(self._clear_points)
         self.export_button.clicked.connect(self._export_coordinates)
         self.save_session_button.clicked.connect(self._save_session)
@@ -364,12 +347,6 @@ class NanotationWidget(QWidget):
             return None
         return self.viewer.layers[POINTS_LAYER_NAME]
 
-    def _zoom_in(self) -> None:
-        self._set_zoom(float(self.viewer.camera.zoom) * ZOOM_STEP)
-
-    def _zoom_out(self) -> None:
-        self._set_zoom(float(self.viewer.camera.zoom) / ZOOM_STEP)
-
     def _reset_zoom(self) -> None:
         if hasattr(self.viewer, "reset_view"):
             self.viewer.reset_view()
@@ -382,8 +359,7 @@ class NanotationWidget(QWidget):
         self.viewer.camera.zoom = min(MAX_ZOOM, max(MIN_ZOOM, float(zoom)))
         self._update_zoom_label()
 
-    def _update_zoom_label(self, event=None) -> None:
-        del event
+    def _update_zoom_label(self, _event=None) -> None:
         self.zoom_label.setText(f"Zoom: {float(self.viewer.camera.zoom):.2f}x")
 
     def _reset_frame_position(self) -> None:
@@ -498,12 +474,10 @@ class NanotationWidget(QWidget):
             display_range=self._contrast_display_limits_range(),
         )
 
-    def _hide_napari_layer_controls(self, event=None) -> None:
-        del event
+    def _hide_napari_layer_controls(self, _event=None) -> None:
         hide_layer_controls(self.viewer)
 
-    def _update_plot_frame_index(self, event=None) -> None:
-        del event
+    def _update_plot_frame_index(self, _event=None) -> None:
         current_step = tuple(getattr(self.viewer.dims, "current_step", ()))
         if current_step:
             self.annotation_plot.set_frame_index(current_step[0])
@@ -680,8 +654,7 @@ class NanotationWidget(QWidget):
             return
         self.summary_label.setText(f"Exported {count} track entries to {path}")
 
-    def _update_point_count(self, event=None) -> None:
-        del event
+    def _update_point_count(self, _event=None) -> None:
         points = self._points_layer()
         count = len(points.data) if points is not None else 0
         if self.records:
@@ -698,10 +671,6 @@ class NanotationWidget(QWidget):
             )
             self.annotation_plot.set_annotations(coordinates, self._smoothed_path.sample())
             self._update_intersection_marker()
-
-    def _path_smoothness_changed(self, value: float) -> None:
-        del value
-        self._update_point_count()
 
     def _remove_layer(self, name: str) -> None:
         if name in self.viewer.layers:

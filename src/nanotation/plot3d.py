@@ -7,7 +7,7 @@ from qtpy.QtWidgets import QLabel, QVBoxLayout, QWidget
 from .annotations import annotation_xyz_coordinates, dashed_neighbor_segments
 
 
-ANNOTATION_PLOT_SIZE = (400, 450)
+ANNOTATION_PLOT_SIZE = (400, 500)
 CHECKPOINT_MARKER_SIZE = 14
 CHECKPOINT_MARKER_FACE_COLOR = (0.0, 0.333, 1.0, 0.75)
 CHECKPOINT_MARKER_EDGE_COLOR = (0.5, 0.8, 1.0, 1.0)
@@ -124,9 +124,7 @@ class Annotation3DPlot(QWidget):
         self._set_marker_data(self._xyz)
         self._axis = scene.visuals.XYZAxis(parent=self._view.scene)
 
-        instructions = QLabel(
-            "3D annotations — click a point to jump; drag to rotate; scroll to zoom"
-        )
+        instructions = QLabel("3D annotations — click a point to jump")
         instructions.setWordWrap(True)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
