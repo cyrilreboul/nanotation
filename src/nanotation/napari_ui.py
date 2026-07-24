@@ -3,7 +3,7 @@ from __future__ import annotations
 from qtpy.QtWidgets import QAbstractButton
 
 
-DEFAULT_INTERPOLATION = "bicubic"
+DEFAULT_INTERPOLATION = "spline36"
 EMAN2_IMAGE_ORIENTATION_2D = ("up", "right")
 
 LAYER_CONTROLS_TO_HIDE = {

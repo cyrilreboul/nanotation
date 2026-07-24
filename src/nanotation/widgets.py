@@ -36,14 +36,15 @@ from .plot3d import Annotation3DPlot
 from .sessions import NanotationSession, read_session_file, write_session_file
 
 
-IMAGE_LAYER_NAME = "MRC time-series"
+IMAGE_LAYER_NAME = "Time-series"
 POINTS_LAYER_NAME = "Path checkpoints"
 INTERSECTION_LAYER_NAME = "Smooth path"
 POINT_BORDER_COLOR = "#0055ffff"
-POINT_OPACITY = 0.6
-IMAGE_CHECKPOINT_SIZE = 32
+POINT_OPACITY = 0.3
+POINT_SYMBOL = "square"
+IMAGE_CHECKPOINT_SIZE = 64
 INTERSECTION_COLOR = "#ffaa00ff"
-INTERSECTION_OPACITY = 0.4
+INTERSECTION_OPACITY = 0.3
 INTERSECTION_SIZE = 24
 MIN_ZOOM = 0.01
 MAX_ZOOM = 100.0
@@ -264,12 +265,14 @@ class NanotationWidget(QWidget):
         )
         self._image_layer = image_layer
         set_default_image_interpolation(image_layer)
+        image_layer.events.contrast_limits.connect(self._update_current_frame_histogram)
         points = self.viewer.add_points(
             np.empty((0, 3), dtype=float),
             name=POINTS_LAYER_NAME,
             ndim=3,
             scale=scale,
             size=IMAGE_CHECKPOINT_SIZE,
+            symbol=POINT_SYMBOL,
             face_color="transparent",
             border_color=POINT_BORDER_COLOR,
             border_width=0.2,
@@ -288,6 +291,7 @@ class NanotationWidget(QWidget):
             opacity=INTERSECTION_OPACITY,
         )
         intersection.editable = False
+        intersection.events.current_size.connect(self._synchronize_intersection_size)
         points.events.data.connect(self._update_point_count)
         self.viewer.dims.ndisplay = 2
         self._reset_frame_position()
@@ -465,7 +469,7 @@ class NanotationWidget(QWidget):
                 pass
         return self._contrast_display_range
 
-    def _update_current_frame_histogram(self) -> None:
+    def _update_current_frame_histogram(self, _event=None) -> None:
         low, high = self._contrast_limits()
         self.histogram_widget.set_histogram(
             self._current_frame_data(),
@@ -507,6 +511,13 @@ class NanotationWidget(QWidget):
         if not np.array_equal(np.asarray(layer.data), data):
             layer.data = data
         layer.editable = False
+
+    def _synchronize_intersection_size(self, _event=None) -> None:
+        if INTERSECTION_LAYER_NAME not in self.viewer.layers:
+            return
+        layer = self.viewer.layers[INTERSECTION_LAYER_NAME]
+        if len(layer.data) and not np.all(np.asarray(layer.size) == layer.current_size):
+            layer.size = layer.current_size
 
     def _go_to_frame(self, frame_index: int) -> None:
         if not self.records:

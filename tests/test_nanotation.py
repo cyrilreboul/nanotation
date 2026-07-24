@@ -38,7 +38,14 @@ from nanotation.plot3d import (
 )
 from nanotation.sessions import read_session_file, write_session_file
 from nanotation.widgets import (
+    IMAGE_LAYER_NAME,
     IMAGE_CHECKPOINT_SIZE,
+    INTERSECTION_LAYER_NAME,
+    INTERSECTION_OPACITY,
+    INTERSECTION_SIZE,
+    NanotationWidget,
+    POINT_OPACITY,
+    POINT_SYMBOL,
     _capture_refresh_annotations,
     _remap_refresh_annotations,
 )
@@ -237,7 +244,7 @@ def test_eman2_image_orientation_sets_y_axis_up() -> None:
     assert viewer.camera.orientation2d == EMAN2_IMAGE_ORIENTATION_2D
 
 
-def test_default_image_interpolation_is_bicubic() -> None:
+def test_default_image_interpolation_is_spline36() -> None:
     class ImageLayer:
         interpolation2d = "linear"
         interpolation3d = "linear"
@@ -246,15 +253,83 @@ def test_default_image_interpolation_is_bicubic() -> None:
 
     set_default_image_interpolation(layer)
 
-    assert DEFAULT_INTERPOLATION == "bicubic"
-    assert layer.interpolation2d == "bicubic"
-    assert layer.interpolation3d == "bicubic"
+    assert DEFAULT_INTERPOLATION == "spline36"
+    assert layer.interpolation2d == "spline36"
+    assert layer.interpolation3d == "spline36"
 
 
-def test_default_checkpoint_sizes_are_distinct_for_image_and_3d_views() -> None:
-    assert IMAGE_CHECKPOINT_SIZE == 32
+def test_default_layer_display_settings() -> None:
+    assert IMAGE_LAYER_NAME == "Time-series"
+    assert IMAGE_CHECKPOINT_SIZE == 64
+    assert POINT_OPACITY == pytest.approx(0.3)
+    assert POINT_SYMBOL == "square"
+    assert INTERSECTION_SIZE == 24
+    assert INTERSECTION_OPACITY == pytest.approx(0.3)
     assert CHECKPOINT_MARKER_SIZE == 14
     assert ANNOTATION_PLOT_SIZE == (400, 500)
+
+
+def test_histogram_thresholds_follow_image_contrast_events() -> None:
+    class Histogram:
+        thresholds = None
+
+        def set_histogram(
+            self,
+            data,
+            *,
+            contrast_low,
+            contrast_high,
+            display_range,
+        ) -> None:
+            del data, display_range
+            self.thresholds = (contrast_low, contrast_high)
+
+    class Widget:
+        histogram_widget = Histogram()
+
+        def _contrast_limits(self):
+            return -2.5, 3.5
+
+        def _current_frame_data(self):
+            return np.zeros((2, 2), dtype=np.float32)
+
+        def _contrast_display_limits_range(self):
+            return -5.0, 5.0
+
+    widget = Widget()
+    NanotationWidget._update_current_frame_histogram(widget, object())
+
+    assert widget.histogram_widget.thresholds == (-2.5, 3.5)
+
+
+def test_smooth_path_size_applies_to_all_existing_intersections() -> None:
+    class Layer:
+        def __init__(self) -> None:
+            self.data = np.zeros((3, 3), dtype=float)
+            self.current_size = 48
+            self._size = np.array([24, 24, 24])
+
+        @property
+        def size(self):
+            return self._size
+
+        @size.setter
+        def size(self, value) -> None:
+            self._size = np.full(len(self.data), value)
+
+    class Viewer:
+        layers = {INTERSECTION_LAYER_NAME: Layer()}
+
+    class Widget:
+        viewer = Viewer()
+
+    widget = Widget()
+    NanotationWidget._synchronize_intersection_size(widget, object())
+
+    np.testing.assert_array_equal(
+        widget.viewer.layers[INTERSECTION_LAYER_NAME].size,
+        [48, 48, 48],
+    )
 
 
 def test_layer_controls_hide_transform_button() -> None:
